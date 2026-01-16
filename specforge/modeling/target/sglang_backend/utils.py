@@ -37,7 +37,6 @@ def replaced_logits_processor_forward_for_eagle3(
     return_last_hidden_states: bool = False,
     return_logits: bool = False,
 ) -> LogitsProcessorOutput:
-    import pdb;pdb.set_trace()
     """
     This is a modified forward function for the SGLang's logits processor, adapted from https://github.com/sgl-project/sglang/blob/v0.5.4/python/sglang/srt/layers/logits_processor.py.
     The modification is to return the logits and aux hidden states instead of the last hidden states.
@@ -46,9 +45,10 @@ def replaced_logits_processor_forward_for_eagle3(
     if isinstance(logits_metadata, ForwardBatch):
         logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
-    #     # Handle MoE models that return (hidden_states, router_logits) tuple
-    # if isinstance(hidden_states, tuple):
-    #     hidden_states = hidden_states[0]
+    # Handle qwen3_vl that return (hidden_states, aux_hidden_states) tuple
+    if isinstance(hidden_states, tuple):
+        aux_hidden_states = hidden_states[1]
+        hidden_states = hidden_states[0]
 
     # Check if multi-item scoring is enabled via server args (only for prefill-only requests)
     multi_item_delimiter = get_global_server_args().multi_item_scoring_delimiter
