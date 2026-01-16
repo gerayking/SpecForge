@@ -37,6 +37,7 @@ def replaced_logits_processor_forward_for_eagle3(
     return_last_hidden_states: bool = False,
     return_logits: bool = False,
 ) -> LogitsProcessorOutput:
+    import pdb;pdb.set_trace()
     """
     This is a modified forward function for the SGLang's logits processor, adapted from https://github.com/sgl-project/sglang/blob/v0.5.4/python/sglang/srt/layers/logits_processor.py.
     The modification is to return the logits and aux hidden states instead of the last hidden states.

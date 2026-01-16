@@ -607,7 +607,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 vision_start_token_id=self.vision_start_token_id,
                 model_type=self.model_type,
                 input_ids=input_id_flat.unsqueeze(0),
-                image_grid_thw=image_grid_thw_,
+                image_grid_thw=image_grid_thw_.cpu() if image_grid_thw_ is not None else None,
                 tokens_per_second=self.tokens_per_second,
             )
 
@@ -620,7 +620,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 pad_value=self.image_token_id,  # Required for placeholder tensor creation
                 offsets=offset,  # List of (start, end) tuples
             )
-            mm_item.set("image_grid_thw", image_grid_thw_)
+            mm_item.set("image_grid_thw", image_grid_thw_.cpu())
             mm_inputs = MultimodalInputs(
                 mm_items=[mm_item],
                 im_token_id=self.image_token_id,

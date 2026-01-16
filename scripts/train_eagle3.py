@@ -649,7 +649,6 @@ def main():
     # ================================================
     parser, args = parse_args()
     set_seed(args.seed)
-    # init_mm_embedding_cache(1024 * 1024 * 1024 * 2)
     init_distributed(
         timeout=args.dist_timeout,
         tp_size=args.tp_size,

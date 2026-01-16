@@ -11,20 +11,16 @@ torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_eagle3.py \
-<<<<<<< HEAD
-    --target-model-path /disk3/wjp/pretrained_models/Qwen2.5-VL-7B-Instruct \
-    --draft-model-config $ROOT_DIR/configs/qwen2.5-vl-7b-eagle3.json \
-    --train-data-path $ROOT_DIR/cache/dataset/allava4v_train_2w.jsonl \
-    --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
-    --output-dir $ROOT_DIR/outputs/Qwen2.5-VL-7B-Instruct-2w \
-=======
+    --target-model-path /home/qspace/base_models_Qwen2.5-VL-7B-Instruct_export \
+    --draft-model-config $ROOT_DIR/configs/qwen2-5-vl-7b-eagle3.json \
+    --train-data-path $ROOT_DIR/cache/dataset/allava4v_train.jsonl \
     --target-model-path /home/qspace/Qwen2.5-VL-7B-Instruct \
     --draft-model-config $ROOT_DIR/configs/qwen2-5-vl-7b-eagle3.json \
     --train-data-path /mnt/cephfs/user_xuanweifu/data/datasets/ALLaVA/processed/allava4v_train.jsonl \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
     --output-dir $ROOT_DIR/outputs/Qwen2.5-VL-7B-Instruct \
->>>>>>> 99146a9 (format code)
     --num-epochs 10 \
+    --target-model-backend sglang \
     --batch-size 1 \
     --learning-rate 1e-4 \
     --max-length 4096 \

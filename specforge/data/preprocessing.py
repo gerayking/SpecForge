@@ -182,7 +182,7 @@ def preprocess_vlm_conversations(
             - conversations: A list of conversations, where each conversation is a list of messages.
         chat_template: The chat template to use for formatting the conversations.
         max_length: The maximum length of the tokenized input.
-
+        
     Returns:
         A dictionary containing:
             - input_ids: List of tokenized input IDs.
@@ -398,23 +398,47 @@ def build_eagle3_dataset(
             f"cache_dir and cache_key must be provided together to make caching work"
         )
 
-    # adjust batch size based on dataset type
+    # adjust batch size and shard size based on dataset type
     if is_vlm:
-        batch_size = (
-            200  # reduce batch size for VLM datasets to avoid PyArrow offset overflow
-        )
+        batch_size = 50  # reduce for VLM to avoid memory overflow
+        shard_size = 50000
     else:
-        batch_size = 1000  # default for conversations
-    dataset = dataset.map(
-        preprocess_function,
-        batched=True,
-        num_proc=num_proc,
-        batch_size=batch_size,
-        remove_columns=original_cols,
-        # keep_in_memory=True,
-        load_from_cache_file=load_from_cache_file,
-        cache_file_name=cache_file_name,
-    )
+        batch_size = 500
+        shard_size = 50000
+
+    # 分片处理，避免内存爆炸
+    from datasets import concatenate_datasets
+
+    total_samples = len(dataset)
+    num_shards = (total_samples + shard_size - 1) // shard_size
+    processed_shards = []
+
+    for shard_idx in range(num_shards):
+        start_idx = shard_idx * shard_size
+        end_idx = min(start_idx + shard_size, total_samples)
+        print(f"Processing shard {shard_idx + 1}/{num_shards}: samples {start_idx}-{end_idx}")
+
+        shard = dataset.select(range(start_idx, end_idx))
+
+        # 每个分片的缓存文件名
+        shard_cache_file = None
+        if cache_file_name:
+            shard_cache_file = cache_file_name.replace(".pkl", f"_shard{shard_idx}.pkl")
+
+        processed_shard = shard.map(
+            preprocess_function,
+            batched=True,
+            num_proc=num_proc,
+            batch_size=batch_size,
+            remove_columns=original_cols,
+            load_from_cache_file=load_from_cache_file,
+            cache_file_name=shard_cache_file,
+        )
+        processed_shards.append(processed_shard)
+
+    # 合并所有分片
+    dataset = concatenate_datasets(processed_shards)
+    print(f"Concatenated {num_shards} shards into dataset with {len(dataset)} samples")
 
     dataset.set_format(type="torch")
     return dataset
