@@ -13,7 +13,7 @@ torchrun \
     $ROOT_DIR/scripts/train_eagle3.py \
     --target-model-path /home/qspace/Qwen2.5-VL-7B-Instruct \
     --draft-model-config $ROOT_DIR/configs/qwen2.5-vl-32b-eagle3.json \
-    --train-data-path /mnt/cephfs/user_xuanweifu/data/datasets/ALLaVA/processed/allava4v_train.jsonl \
+    --train-data-path $ROOT_DIR/cache/allava4v_train.jsonl \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
     --output-dir $ROOT_DIR/outputs/1222_android4_step_70 \
     --num-epochs 10 \
