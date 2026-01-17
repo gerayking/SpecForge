@@ -521,15 +521,22 @@ def generate_vocab_mapping_file(
         print(f"Loading vocab mapping from the cached file at: {vocab_mapping_path}")
         return vocab_mapping_path
 
-    # we first count the frequency of effectiev tokens in the dataset
-    token_dict = Counter()
-    for item in tqdm(dataset, desc="Counting tokens for vocab mapping"):
+    # we first count the frequency of effective tokens in the dataset
+    # Optimized: collect all masked tokens first, then use bincount for O(n) counting
+    all_masked_ids = []
+    for item in tqdm(dataset, desc="Collecting tokens for vocab mapping"):
         input_ids = item["input_ids"]
         loss_mask = item["loss_mask"]
-        masked_ids = input_ids[loss_mask == 1]
-        unique_ids, counts = masked_ids.unique(return_counts=True)
-        batch_token_dict = dict(zip(unique_ids.tolist(), counts.tolist()))
-        token_dict.update(batch_token_dict)
+        all_masked_ids.append(input_ids[loss_mask == 1])
+
+    # Concatenate and count using bincount (O(n), much faster than unique which is O(n log n))
+    all_ids = torch.cat(all_masked_ids)
+    counts = torch.bincount(all_ids, minlength=target_vocab_size)
+    # Convert to Counter format for compatibility with downstream code
+    nonzero_indices = counts.nonzero(as_tuple=True)[0]
+    token_dict = Counter(
+        dict(zip(nonzero_indices.tolist(), counts[nonzero_indices].tolist()))
+    )
 
     # generate the d2t and t2d mapping
     d2t, t2d = process_token_dict_to_mappings(

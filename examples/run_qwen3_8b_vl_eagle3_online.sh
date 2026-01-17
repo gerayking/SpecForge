@@ -11,11 +11,11 @@ torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_eagle3.py \
-    --target-model-path /home/qspace/Qwen2.5-VL-7B-Instruct \
-    --draft-model-config $ROOT_DIR/configs/qwen2.5-vl-32b-eagle3.json \
-    --train-data-path /mnt/cephfs/user_xuanweifu/data/datasets/ALLaVA/processed/allava4v_train.jsonl \
+    --target-model-path /home/qspace/Qwen3-VL-8B-Instruct \
+    --draft-model-config $ROOT_DIR/configs/qwen3-vl-8b-eagle3.json \
+    --train-data-path /mnt/cephfs/user_xuanweifu/data/datasets/allava4v-train-regenerated/allava4v_train_regenerated_processed.jsonl \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
-    --output-dir $ROOT_DIR/outputs/1222_android4_step_70 \
+    --output-dir $ROOT_DIR/outputs/Qwen3-VL-8B-Instruct-allava4v-regenerated \
     --num-epochs 10 \
     --batch-size 1 \
     --learning-rate 1e-4 \
@@ -24,14 +24,13 @@ torchrun \
     --chat-template qwen2-vl \
     --target-model-backend sglang \
     --cache-dir $ROOT_DIR/cache \
-    --embedding-key model.embed_tokens.weight \
-    --tp-size 8 \
+    --embedding-key model.language_model.embed_tokens.weight \
+    --tp-size 2 \
     --sglang-mem-fraction-static 0.5 \
     --is-vlm \
-    --torch-dtype bfloat16 \
     --min-pixels 50176 \
     --max-pixels 802816 \
     --report-to wandb \
     --wandb-key local-3a5edad7b716f6135697b662e2716e785ba80432 \
     --wandb-project luban-eagle3 \
-    --wandb-name 1222_android4_step_70
+    --wandb-name Qwen3-VL-8B-Instruct-allava4v-regenerated

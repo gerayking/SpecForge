@@ -97,6 +97,11 @@ def test_vlm(rank, world_size, port, tp_size):
     model_path = "Qwen/Qwen2.5-VL-32B-Instruct"
 
     # Use Qwen2.5-VL processor to prepare inputs
+<<<<<<< HEAD
+=======
+    import requests
+    from PIL import Image
+>>>>>>> 99146a9 (format code)
     from qwen_vl_utils import process_vision_info
     from transformers import Qwen2_5_VLProcessor
 
@@ -186,9 +191,13 @@ def test_vlm(rank, world_size, port, tp_size):
             )
         padded_input_ids.append(input_ids)
         padded_attention_mask.append(attention_mask)
+<<<<<<< HEAD
         padded_loss_mask.append(
             attention_mask.clone()
         )  # loss_mask same as attention_mask
+=======
+        padded_loss_mask.append(attention_mask.clone())  # loss_mask same as attention_mask
+>>>>>>> 99146a9 (format code)
 
     # Stack into batches
     input_ids = torch.cat(padded_input_ids, dim=0).cuda()
@@ -367,9 +376,13 @@ def test_vlm_multi_batch(rank, world_size, port, tp_size):
             )
         padded_input_ids.append(input_ids)
         padded_attention_mask.append(attention_mask)
+<<<<<<< HEAD
         padded_loss_mask.append(
             attention_mask.clone()
         )  # loss_mask same as attention_mask
+=======
+        padded_loss_mask.append(attention_mask.clone())  # loss_mask same as attention_mask
+>>>>>>> 99146a9 (format code)
 
     # Stack into batches
     input_ids = torch.cat(padded_input_ids, dim=0).cuda()

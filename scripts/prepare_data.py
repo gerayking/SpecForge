@@ -90,14 +90,16 @@ def parse_args():
     return parser.parse_args()
 
 
-def get_cache_dir(dataset_name):
+def get_cache_dir(dataset_name, data_path=None):
     cache_dir = None
     if dataset_name == "sharegpt4v":
         raise ValueError("Downloading 'sharegpt4v' is not supported.")
     elif dataset_name == "allava4v":
-        cache_dir = os.path.join(
-            config.HF_DATASETS_CACHE, "FreedomIntelligence", "ALLaVA"
-        )
+        if data_path is not None:
+            # 使用用户指定的本地路径
+            cache_dir = data_path
+        else:
+            cache_dir = os.path.join(config.HF_DATASETS_CACHE, "ALLaVA")
     else:
         raise ValueError(
             f"Dataset '{dataset_name}' is not a supported VLM dataset for download."
@@ -186,7 +188,9 @@ def process_sharegpt_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int
     return row, skipped_count
 
 
-def process_sharegpt4v_row(row, dataset_name: str = None) -> Dict:
+def process_sharegpt4v_row(
+    row, dataset_name: str = None, cache_dir: str = None
+) -> Dict:
     """
     sharegpt4v dataset schema:
     {
@@ -201,9 +205,10 @@ def process_sharegpt4v_row(row, dataset_name: str = None) -> Dict:
         ]
     }
     """
-    cache_dir = get_cache_dir(dataset_name)
+    if cache_dir is None:
+        cache_dir = get_cache_dir(dataset_name)
     conversations = row["conversations"]
-    image = os.path.join(cache_dir, row["image"])
+    image = os.path.join(cache_dir, os.path.basename(row["image"]))
     if not os.path.exists(image):
         print(f"Image path {image} does not exist, skipping this sample.")
         return None, None
@@ -345,11 +350,27 @@ def main():
         download_vlm_dataset(args.dataset)
         proc_fn = process_sharegpt4v_row
     elif args.dataset == "allava4v":
-        ds = load_dataset("FreedomIntelligence/ALLaVA-4V", name="allava_laion")[
-            "instruct"
-        ]
-        download_vlm_dataset(args.dataset)
-        proc_fn = process_sharegpt4v_row
+        if args.data_path is not None:
+            # 从本地 JSON 文件加载数据
+            print(f"Loading allava4v dataset from local path: {args.data_path}")
+            ds = load_dataset(
+                "json",
+                data_files=os.path.join(
+                    args.data_path, "allava_laion/ALLaVA-Instruct-LAION-4V.json"
+                ),
+                split="train",
+            )
+            # 图片目录为 data_path/allava_laion/images
+            image_base_dir = os.path.join(args.data_path, "allava_laion", "images")
+            from functools import partial
+
+            proc_fn = partial(process_sharegpt4v_row, cache_dir=image_base_dir)
+        else:
+            ds = load_dataset("FreedomIntelligence/ALLaVA-4V", name="allava_laion")[
+                "instruct"
+            ]
+            download_vlm_dataset(args.dataset)
+            proc_fn = process_sharegpt4v_row
     elif args.dataset == "opc":
         if args.opc_subset == "all":
             # Load all subsets and concatenate them
