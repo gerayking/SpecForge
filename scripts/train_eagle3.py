@@ -440,7 +440,6 @@ def build_dataloaders(
         ),
         is_vlm=args.is_vlm,
     )
-    # ForkedPdb().set_trace()
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
         if args.eval_data_path is not None:
             eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
@@ -864,19 +863,18 @@ def main():
                     tracker,
                     mode="eval",
                 )
+            # ================================================
+            # 7.3 Save Checkpoints
+            # ================================================
+            if global_step % args.save_interval == 0:
+                # Save the model
+                save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
 
             if args.max_num_steps is not None and global_step >= args.max_num_steps:
                 break
 
-        # ================================================
-        # 7.3 Save Checkpoints (at end of each epoch)
-        # ================================================
-        print(f"Saving checkpoint-epoch-{epoch}")
-        save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
-
         if args.max_num_steps is not None and global_step >= args.max_num_steps:
             break
-
     # Save final checkpoint if training ended without saving
     if global_step % args.save_interval != 0:
         print_on_rank0(
