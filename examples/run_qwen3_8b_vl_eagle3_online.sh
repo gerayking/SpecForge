@@ -25,7 +25,7 @@ torchrun \
     --target-model-backend sglang \
     --cache-dir $ROOT_DIR/cache \
     --embedding-key model.language_model.embed_tokens.weight \
-    --tp-size 2 \
+    --tp-size 1 \
     --sglang-mem-fraction-static 0.5 \
     --is-vlm \
     --min-pixels 50176 \

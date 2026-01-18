@@ -117,6 +117,7 @@ def preprocess_conversations(
     chat_template: ChatTemplate,
     max_length: int = 2048,
     is_preformatted: bool = False,
+    train_only_last_turn: bool = False,
     **kwargs,
 ) -> Dict[str, List[torch.Tensor]]:
     """
@@ -129,6 +130,7 @@ def preprocess_conversations(
         chat_template: The chat template to use for formatting/identifying spans.
         max_length: The maximum length of the tokenized input.
         is_preformatted: Whether the input is already formatted text strings.
+        train_only_last_turn: If True, only the last assistant turn contributes to the loss.
 
     Returns:
         A dictionary containing:
@@ -158,7 +160,11 @@ def preprocess_conversations(
             # if the source is None, skip it
             continue
         input_ids, loss_mask = parser.parse(
-            source, max_length, preformatted=is_preformatted, **kwargs_item
+            source,
+            max_length,
+            preformatted=is_preformatted,
+            train_only_last_turn=train_only_last_turn,
+            **kwargs_item,
         )
         results["input_ids"].append(input_ids[None, :])
         results["loss_mask"].append(loss_mask[None, :])
@@ -182,7 +188,7 @@ def preprocess_vlm_conversations(
             - conversations: A list of conversations, where each conversation is a list of messages.
         chat_template: The chat template to use for formatting the conversations.
         max_length: The maximum length of the tokenized input.
-        
+
     Returns:
         A dictionary containing:
             - input_ids: List of tokenized input IDs.
@@ -261,10 +267,8 @@ def preprocess_vlm_conversations(
         )
         input_ids = encoding.input_ids[0]
         offsets = encoding.offset_mapping[0]
-        pixel_values = (
-            encoding.pixel_values
-        )  # [total_patches, hidden_dim], no batch dim
-        image_grid_thw = encoding.image_grid_thw  # [num_images, 3], no batch dim
+        pixel_values = encoding.pixel_values
+        image_grid_thw = encoding.image_grid_thw[0]
 
         # get conversation with image info for loss mask generation
         decoded_conversation = processor.tokenizer.decode(
@@ -280,7 +284,7 @@ def preprocess_vlm_conversations(
         results["loss_mask"].append(loss_mask[None, :])
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
         results["pixel_values"].append(pixel_values)
-        results["image_grid_thw"].append(image_grid_thw)
+        results["image_grid_thw"].append(image_grid_thw[None, :])
     return results
 
 
@@ -296,6 +300,7 @@ def build_eagle3_dataset(
     is_vlm: Optional[bool] = False,
     processor: Optional[ImageProcessingMixin] = None,
     is_preformatted: Optional[bool] = False,
+    train_only_last_turn: Optional[bool] = False,
 ) -> HFDataset:
     """
     build eagle3 dataset
@@ -321,6 +326,8 @@ def build_eagle3_dataset(
                         the assistant spans for loss mask generation.
                         If True, expects "text" column with ready-to-train text.
                         If False, expects "conversations" column with ShareGPT format.
+        train_only_last_turn: If True, only the last assistant turn contributes to the loss.
+                             Useful for thinking models where history may not contain thoughts.
 
     Returns:
         The processed HF dataset.
@@ -362,6 +369,7 @@ def build_eagle3_dataset(
                 template,
                 max_length,
                 is_preformatted=True,
+                train_only_last_turn=train_only_last_turn,
             )
         else:
             # Handle ShareGPT conversations
@@ -378,6 +386,7 @@ def build_eagle3_dataset(
                 template,
                 max_length,
                 is_preformatted=False,
+                train_only_last_turn=train_only_last_turn,
                 **examples,
             )
 
@@ -398,47 +407,23 @@ def build_eagle3_dataset(
             f"cache_dir and cache_key must be provided together to make caching work"
         )
 
-    # adjust batch size and shard size based on dataset type
+    # adjust batch size based on dataset type
     if is_vlm:
-        batch_size = 50  # reduce for VLM to avoid memory overflow
-        shard_size = 50000
-    else:
-        batch_size = 500
-        shard_size = 50000
-
-    # 分片处理，避免内存爆炸
-    from datasets import concatenate_datasets
-
-    total_samples = len(dataset)
-    num_shards = (total_samples + shard_size - 1) // shard_size
-    processed_shards = []
-
-    for shard_idx in range(num_shards):
-        start_idx = shard_idx * shard_size
-        end_idx = min(start_idx + shard_size, total_samples)
-        print(f"Processing shard {shard_idx + 1}/{num_shards}: samples {start_idx}-{end_idx}")
-
-        shard = dataset.select(range(start_idx, end_idx))
-
-        # 每个分片的缓存文件名
-        shard_cache_file = None
-        if cache_file_name:
-            shard_cache_file = cache_file_name.replace(".pkl", f"_shard{shard_idx}.pkl")
-
-        processed_shard = shard.map(
-            preprocess_function,
-            batched=True,
-            num_proc=num_proc,
-            batch_size=batch_size,
-            remove_columns=original_cols,
-            load_from_cache_file=load_from_cache_file,
-            cache_file_name=shard_cache_file,
+        batch_size = (
+            200  # reduce batch size for VLM datasets to avoid PyArrow offset overflow
         )
-        processed_shards.append(processed_shard)
-
-    # 合并所有分片
-    dataset = concatenate_datasets(processed_shards)
-    print(f"Concatenated {num_shards} shards into dataset with {len(dataset)} samples")
+    else:
+        batch_size = 1000  # default for conversations
+    dataset = dataset.map(
+        preprocess_function,
+        batched=True,
+        num_proc=num_proc,
+        batch_size=batch_size,
+        remove_columns=original_cols,
+        # keep_in_memory=True,
+        load_from_cache_file=load_from_cache_file,
+        cache_file_name=cache_file_name,
+    )
 
     dataset.set_format(type="torch")
     return dataset
@@ -545,22 +530,15 @@ def generate_vocab_mapping_file(
         print(f"Loading vocab mapping from the cached file at: {vocab_mapping_path}")
         return vocab_mapping_path
 
-    # we first count the frequency of effective tokens in the dataset
-    # Optimized: collect all masked tokens first, then use bincount for O(n) counting
-    all_masked_ids = []
-    for item in tqdm(dataset, desc="Collecting tokens for vocab mapping"):
+    # we first count the frequency of effectiev tokens in the dataset
+    token_dict = Counter()
+    for item in tqdm(dataset, desc="Counting tokens for vocab mapping"):
         input_ids = item["input_ids"]
         loss_mask = item["loss_mask"]
-        all_masked_ids.append(input_ids[loss_mask == 1])
-
-    # Concatenate and count using bincount (O(n), much faster than unique which is O(n log n))
-    all_ids = torch.cat(all_masked_ids)
-    counts = torch.bincount(all_ids, minlength=target_vocab_size)
-    # Convert to Counter format for compatibility with downstream code
-    nonzero_indices = counts.nonzero(as_tuple=True)[0]
-    token_dict = Counter(
-        dict(zip(nonzero_indices.tolist(), counts[nonzero_indices].tolist()))
-    )
+        masked_ids = input_ids[loss_mask == 1]
+        unique_ids, counts = masked_ids.unique(return_counts=True)
+        batch_token_dict = dict(zip(unique_ids.tolist(), counts.tolist()))
+        token_dict.update(batch_token_dict)
 
     # generate the d2t and t2d mapping
     d2t, t2d = process_token_dict_to_mappings(
