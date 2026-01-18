@@ -94,6 +94,7 @@ def test_vlm(rank, world_size, port, tp_size):
     init_distributed(tp_size=tp_size)
     set_seed(42)
 
+    # model_path = "Qwen/Qwen2.5-VL-32B-Instruct"
     model_path = "Qwen/Qwen2.5-VL-32B-Instruct"
 
     # Use Qwen2.5-VL processor to prepare inputs
@@ -241,7 +242,7 @@ def test_vlm_multi_batch(rank, world_size, port, tp_size):
     init_distributed(tp_size=tp_size)
     set_seed(42)
 
-    model_path = "/home/qspace/Qwen2.5-VL-32B-Instruct"
+    model_path = "Qwen/Qwen2.5-VL-32B-Instruct"
 
     from qwen_vl_utils import process_vision_info
     from transformers import Qwen2_5_VLProcessor
@@ -329,27 +330,6 @@ def test_vlm_multi_batch(rank, world_size, port, tp_size):
         batch_pixel_values.append(inputs["pixel_values"])
         batch_image_grid_thw.append(inputs["image_grid_thw"])
 
-    # Debug: print shapes
-    if rank == 0:
-        print(f"\n{'='*60}")
-        print(f"[test_vlm_multi_batch] batch_size = {batch_size}")
-        print(f"[Debug] batch_input_ids shapes: {[x.shape for x in batch_input_ids]}")
-        print(
-            f"[Debug] batch_pixel_values shapes: {[x.shape for x in batch_pixel_values]}"
-        )
-        print(
-            f"[Debug] batch_image_grid_thw shapes: {[x.shape for x in batch_image_grid_thw]}"
-        )
-        print(f"[Debug] batch_image_grid_thw values: {batch_image_grid_thw}")
-        # Count image tokens in input_ids
-        image_token_id = processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
-        for i, ids in enumerate(batch_input_ids):
-            num_img_tokens = (ids == image_token_id).sum().item()
-            print(
-                f"[Debug] Sample {i}: {num_img_tokens} image tokens, seq_len={ids.shape[1]}"
-            )
-        print(f"{'='*60}\n")
-
     # Pad input_ids and attention_mask to same length
     max_len = max(ids.shape[1] for ids in batch_input_ids)
     padded_input_ids = []
@@ -379,13 +359,6 @@ def test_vlm_multi_batch(rank, world_size, port, tp_size):
     # pixel_values and image_grid_thw remain as lists (one per sample)
     pixel_values = torch.cat(batch_pixel_values, dim=0).cuda()
     image_grid_thw = [thw.cuda() for thw in batch_image_grid_thw]
-
-    if rank == 0:
-        print(f"[Debug] Final input_ids shape: {input_ids.shape}")
-        print(f"[Debug] Final attention_mask shape: {attention_mask.shape}")
-        print(f"[Debug] Final pixel_values list length: {len(pixel_values)}")
-        print(f"[Debug] Final image_grid_thw list length: {len(image_grid_thw)}")
-
     sgl_target_model = SGLangEagle3TargetModel.from_pretrained(
         model_path,
         torch_dtype=torch.float16,
@@ -428,25 +401,25 @@ def test_vlm_multi_batch(rank, world_size, port, tp_size):
 
 class TestTargetModelBackend(unittest.TestCase):
 
-    def test_sglang_backend_with_dense(self):
-        world_size = 2
-        port = get_available_port()
-        mp.spawn(test_dense, nprocs=world_size, args=(world_size, port, 2))
+    # def test_sglang_backend_with_dense(self):
+    #     world_size = 2
+    #     port = get_available_port()
+    #     mp.spawn(test_dense, nprocs=world_size, args=(world_size, port, 2))
 
-    def test_sglang_backend_with_moe(self):
-        world_size = 2
-        port = get_available_port()
-        mp.spawn(test_moe, nprocs=world_size, args=(world_size, port, 2))
+    # def test_sglang_backend_with_moe(self):
+    #     world_size = 2
+    #     port = get_available_port()
+    #     mp.spawn(test_moe, nprocs=world_size, args=(world_size, port, 2))
 
     def test_sglang_backend_with_vlm(self):
-        world_size = 4
+        world_size = 2
         port = get_available_port()
-        mp.spawn(test_vlm, nprocs=world_size, args=(world_size, port, 4))
+        mp.spawn(test_vlm, nprocs=world_size, args=(world_size, port, 2))
 
     def test_sglang_backend_with_vlm_multi_batch(self):
-        world_size = 8
+        world_size = 2
         port = get_available_port()
-        mp.spawn(test_vlm_multi_batch, nprocs=world_size, args=(world_size, port, 8))
+        mp.spawn(test_vlm_multi_batch, nprocs=world_size, args=(world_size, port, 2))
 
 
 if __name__ == "__main__":

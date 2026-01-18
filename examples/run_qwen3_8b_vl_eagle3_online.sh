@@ -13,7 +13,7 @@ torchrun \
     $ROOT_DIR/scripts/train_eagle3.py \
     --target-model-path /home/qspace/Qwen3-VL-8B-Instruct \
     --draft-model-config $ROOT_DIR/configs/qwen3-vl-8b-eagle3.json \
-    --train-data-path /mnt/cephfs/user_xuanweifu/data/datasets/allava4v-train-regenerated/allava4v_train_regenerated_processed.jsonl \
+    --train-data-path $ROOT_DIR/data/datasets/allava4v-train-regenerated/allava4v_train_regenerated_processed.jsonl \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
     --output-dir $ROOT_DIR/outputs/Qwen3-VL-8B-Instruct-allava4v-regenerated \
     --num-epochs 10 \
@@ -30,7 +30,3 @@ torchrun \
     --is-vlm \
     --min-pixels 50176 \
     --max-pixels 802816 \
-    --report-to wandb \
-    --wandb-key local-3a5edad7b716f6135697b662e2716e785ba80432 \
-    --wandb-project luban-eagle3 \
-    --wandb-name Qwen3-VL-8B-Instruct-allava4v-regenerated
