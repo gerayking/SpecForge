@@ -36,6 +36,7 @@ from specforge.algorithms.contracts import (
 
 ALGORITHM_NAME = "dspark"
 DRAFT_ARCHITECTURE = "DSparkDraftModel"
+TARGET_KV_DRAFT_ARCHITECTURE = "DSparkTargetKVDraftModel"
 
 
 def build_step(wrapped_model, *, target_head=None, **_options):
@@ -48,7 +49,7 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 def resume_contract(_config, draft_model, training_model):
     """Persist resolved DSpark model, sampling, and objective semantics."""
 
-    return {
+    values = {
         "dspark_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "dspark_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
@@ -64,6 +65,22 @@ def resume_contract(_config, draft_model, training_model):
             training_model.dspark_confidence_head_alpha
         ),
     }
+    contract = getattr(draft_model, "target_kv_contract", None)
+    if contract is not None:
+        import hashlib
+        import json
+
+        encoded = json.dumps(
+            contract, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
+        values.update(
+            {
+                "dspark_input_mode": "target_kv",
+                "target_kv_contract_sha256": hashlib.sha256(encoded).hexdigest(),
+                "dspark_lambda_tv": float(training_model.lambda_tv),
+            }
+        )
+    return values
 
 
 def build_draft(config, draft_config):
@@ -112,7 +129,10 @@ def algorithm_spec() -> AlgorithmSpec:
     return AlgorithmSpec(
         name=ALGORITHM_NAME,
         draft=DraftRequirement(
-            compatible_architectures={DRAFT_ARCHITECTURE},
+            compatible_architectures={
+                DRAFT_ARCHITECTURE,
+                TARGET_KV_DRAFT_ARCHITECTURE,
+            },
             default_architecture=DRAFT_ARCHITECTURE,
         ),
         feature_contracts=(
@@ -156,6 +176,7 @@ def algorithm_providers() -> AlgorithmProviders:
             draft_config=DraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
                 expected_auto_map_model="dspark.DSparkDraftModel",
+                alternative_architectures=frozenset({TARGET_KV_DRAFT_ARCHITECTURE}),
             ),
             build_draft=build_draft,
             build_training_model=build_training_model,

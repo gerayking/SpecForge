@@ -26,6 +26,7 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
    basic_usage/data_preparation.md
    basic_usage/training.md
    basic_usage/disaggregated_training.md
+   basic_usage/mooncake_target_kv_training.md
 
 .. toctree::
    :maxdepth: 1

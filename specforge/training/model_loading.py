@@ -288,11 +288,12 @@ def resolve_draft_config(
         draft_config = _generate_draft_config(cfg, provider)
 
     expected = provider.architecture
+    allowed = {expected, *provider.alternative_architectures}
     architectures = list(getattr(draft_config, "architectures", None) or [])
-    if architectures != [expected]:
+    if len(architectures) != 1 or architectures[0] not in allowed:
         raise ValueError(
             f"training.strategy={cfg.training.strategy!r} requires draft "
-            f"architecture {expected}, got {architectures!r}"
+            f"architecture in {sorted(allowed)}, got {architectures!r}"
         )
     _apply_draft_overrides(cfg, draft_config, provider)
     return draft_config

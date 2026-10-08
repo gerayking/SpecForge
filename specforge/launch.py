@@ -60,6 +60,7 @@ def _assemble_trainer(
     collate_fn,
     strategy_kwargs: Optional[Mapping[str, Any]] = None,
     per_sample_transform=None,
+    clone_on_fetch: bool = True,
     durable_ack: bool = True,
     resume_from: Optional[str] = None,
     resume_state: Optional[dict] = None,
@@ -134,6 +135,7 @@ def _assemble_trainer(
         collate_fn=collate_fn,
         strategy_kwargs=strategy_kwargs,
         per_sample_transform=per_sample_transform,
+        clone_on_fetch=clone_on_fetch,
         durable_ack=durable_ack,
         resume_from=resume_from,
         resume_state=resume_state,
@@ -630,6 +632,122 @@ def build_offline_runtime(
         sp_ring_size=sp_ring_size,
         dataloader_num_workers=dataloader_num_workers,
         profiling_options=profiling_options,
+    )
+
+
+def _build_mooncake_snapshot_runtime(
+    *,
+    algorithm: AlgorithmRegistration,
+    modality: str = "text",
+    snapshot_config,
+    draft_model,
+    optimizer_factory,
+    run_id: str,
+    output_dir: str,
+    max_len: int = 2048,
+    batch_size: int = 1,
+    accumulation_steps: int = 1,
+    num_epochs: int = 1,
+    max_steps: Optional[int] = None,
+    total_steps: Optional[int] = None,
+    save_interval: int = 0,
+    eval_interval: int = 0,
+    logger=None,
+    log_interval: int = 50,
+    seed: int = 0,
+    resume_from: Optional[str] = None,
+    max_checkpoints: int = 0,
+    strategy_kwargs: Optional[Mapping[str, Any]] = None,
+    dataloader_num_workers: int = 0,
+    profiling_options=None,
+):
+    """Train from immutable SGLang target-KV snapshots in Mooncake."""
+
+    if algorithm.name != "dspark":
+        raise ValueError("target-KV snapshots currently require DSpark")
+    if modality != "text":
+        raise ValueError("target-KV snapshots currently support text models only")
+    if eval_interval:
+        raise ValueError("target-KV snapshot evaluation is not configured")
+    contract = getattr(draft_model, "target_kv_contract", None)
+    if contract is None:
+        raise ValueError("snapshot training requires a DSparkTargetKVDraftModel config")
+    from specforge.algorithms.common.target_kv_data import (
+        build_target_kv_collator,
+        build_target_kv_normalizer,
+    )
+    from specforge.runtime.data_plane.training_snapshot import (
+        MooncakeSnapshotFeatureStore,
+        SnapshotRefReader,
+    )
+
+    source_refs = SnapshotRefReader(
+        snapshot_config.refs_path,
+        run_id=run_id,
+        strategy=algorithm.name,
+    ).read()
+
+    def refs_for_epoch(epoch):
+        return _shard_offline_refs(
+            source_refs,
+            use_usp_preprocess=False,
+            seed=seed,
+            epoch=epoch,
+        )
+
+    refs = refs_for_epoch(0)
+    setup_kwargs = {
+        "local_hostname": snapshot_config.local_hostname,
+        "metadata_server": snapshot_config.metadata_server,
+        "master_server_addr": snapshot_config.master_server_addr,
+        "protocol": snapshot_config.protocol,
+        "rdma_devices": snapshot_config.rdma_devices,
+        "global_segment_size": snapshot_config.global_segment_size_bytes,
+        "local_buffer_size": snapshot_config.local_buffer_size_bytes,
+    }
+    store = MooncakeSnapshotFeatureStore(
+        setup_kwargs=setup_kwargs,
+        max_receive_bytes=snapshot_config.max_receive_bytes,
+        expected_contract=contract,
+    )
+    controller = DataFlowController(
+        run_id,
+        metadata_store=NoOpMetadataStore(),
+        enable_sample_queue=False,
+    )
+    return _assemble_trainer(
+        algorithm=algorithm,
+        controller=controller,
+        store=store,
+        ref_source={"refs": refs, "refs_for_epoch": refs_for_epoch},
+        model=draft_model,
+        target_head=None,
+        optimizer_factory=optimizer_factory,
+        run_id=run_id,
+        output_dir=output_dir,
+        batch_size=batch_size,
+        accumulation_steps=accumulation_steps,
+        num_epochs=num_epochs,
+        max_steps=max_steps,
+        total_steps=total_steps,
+        save_interval=save_interval,
+        logger=logger,
+        log_interval=log_interval,
+        collate_fn=build_target_kv_collator(contract),
+        per_sample_transform=build_target_kv_normalizer(contract, max_len),
+        clone_on_fetch=False,
+        durable_ack=False,
+        resume_from=resume_from,
+        checkpoint_extra={
+            "offline_sampler_version": 1,
+            "sampler_seed": seed,
+            "source_dataset_size": len(source_refs),
+            "snapshot_payload_format": "maas_target_kv_v1",
+        },
+        max_checkpoints=max_checkpoints,
+        dataloader_num_workers=dataloader_num_workers,
+        profiling_options=profiling_options,
+        on_fit_finally=store.close,
     )
 
 

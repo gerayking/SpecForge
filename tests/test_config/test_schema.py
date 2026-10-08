@@ -63,6 +63,19 @@ def _managed_local_payload(*, ep_size: int) -> dict:
     return payload
 
 
+def _mooncake_snapshot_payload() -> dict:
+    payload = copy.deepcopy(MINIMAL)
+    payload["data"] = {
+        "mooncake_snapshots": {
+            "refs_path": "/data/publications.jsonl",
+            "metadata_server": "127.0.0.1:2379",
+            "master_server_addr": "127.0.0.1:50051",
+        }
+    }
+    payload["training"] = {"strategy": "dspark"}
+    return payload
+
+
 def _write(payload: dict, suffix: str) -> str:
     fd, path = tempfile.mkstemp(suffix=suffix)
     with os.fdopen(fd, "w") as f:
@@ -76,6 +89,32 @@ def _write(payload: dict, suffix: str) -> str:
 
 
 class ConfigSchemaTest(unittest.TestCase):
+    def test_mooncake_snapshot_source_is_strict_offline_dspark(self):
+        payload = _mooncake_snapshot_payload()
+        config = Config.model_validate(payload)
+        self.assertEqual(config.mode, "offline")
+        self.assertEqual(config.training.strategy, "dspark")
+        resolve_run(config)
+
+        invalid_fields = {
+            "strategy": "eagle3",
+            "accumulation_steps": 2,
+            "loss_decay_gamma": 4.0,
+            "tp_size": 2,
+        }
+        for field, value in invalid_fields.items():
+            invalid = _mooncake_snapshot_payload()
+            invalid["training"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValidationError):
+                Config.model_validate(invalid)
+
+        invalid = _mooncake_snapshot_payload()
+        invalid["data"]["mooncake_snapshots"].update(
+            {"protocol": "rdma", "rdma_devices": ""}
+        )
+        with self.assertRaises(ValidationError):
+            Config.model_validate(invalid)
+
     def test_liger_kernel_flag_is_typed_and_defaults_off(self):
         default = Config.model_validate(copy.deepcopy(MINIMAL))
         self.assertFalse(default.model.use_liger_kernel)

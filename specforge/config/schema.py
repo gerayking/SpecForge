@@ -122,6 +122,37 @@ class ModelConfig(StrictConfigModel):
         return self
 
 
+class MooncakeSnapshotDataConfig(StrictConfigModel):
+    """Published SGLang snapshot references and the Mooncake reader endpoint."""
+
+    refs_path: str
+    metadata_server: str
+    master_server_addr: str
+    local_hostname: str = "127.0.0.1"
+    protocol: Literal["tcp", "rdma"] = "tcp"
+    rdma_devices: str = ""
+    global_segment_size_bytes: int = Field(default=0, ge=0)
+    local_buffer_size_bytes: int = Field(default=256 << 20, gt=0)
+    max_receive_bytes: int = Field(default=2 << 30, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_snapshot_endpoint(self):
+        for name in (
+            "refs_path",
+            "metadata_server",
+            "master_server_addr",
+            "local_hostname",
+        ):
+            value = getattr(self, name)
+            if not value or value.strip() != value:
+                raise ValueError(f"data.mooncake_snapshots.{name} must be non-empty")
+        if self.protocol == "rdma" and not self.rdma_devices:
+            raise ValueError(
+                "data.mooncake_snapshots.rdma_devices is required for RDMA"
+            )
+        return self
+
+
 class DataConfig(StrictConfigModel):
     #: online mode — raw conversation JSON/JSONL.
     train_data_path: str = ""
@@ -129,6 +160,8 @@ class DataConfig(StrictConfigModel):
     prompts_path: str = ""
     #: offline mode — directory of precomputed hidden-state .ckpt files.
     hidden_states_path: str = ""
+    #: Immutable ``maas_target_kv_v1`` publications read directly from Mooncake.
+    mooncake_snapshots: Optional[MooncakeSnapshotDataConfig] = None
     #: Reserved migration field. Online evaluation is unsupported; keep empty.
     eval_data_path: str = ""
     #: offline evaluation — directory of precomputed hidden-state .ckpt files.
@@ -151,12 +184,14 @@ class DataConfig(StrictConfigModel):
             bool(self.train_data_path),
             bool(self.prompts_path),
             bool(self.hidden_states_path),
+            self.mooncake_snapshots is not None,
         ]
         if sum(sources) != 1:
             raise ValueError(
                 "set exactly one of data.train_data_path (raw online data), "
                 "data.prompts_path (pre-tokenized online data), or "
-                "data.hidden_states_path (offline features)"
+                "data.hidden_states_path (offline features), or "
+                "data.mooncake_snapshots (published target-KV snapshots)"
             )
         return self
 
@@ -673,6 +708,41 @@ class Config(StrictConfigModel):
         mode = self.mode
         deployment = self.deployment.mode
         role = self.training.role
+        snapshot_mode = self.data.mooncake_snapshots is not None
+
+        if snapshot_mode:
+            if self.training.strategy != "dspark":
+                raise ValueError("Mooncake target-KV snapshots require strategy=dspark")
+            if deployment != "local_colocated" or role != "all":
+                raise ValueError(
+                    "Mooncake snapshot training currently uses the trainer-only "
+                    "local_colocated topology with training.role=all"
+                )
+            if self.data.eval_hidden_states_path or self.training.eval_interval:
+                raise ValueError(
+                    "Mooncake snapshot training does not yet support evaluation data"
+                )
+            if self.training.attention_backend == "usp":
+                raise ValueError(
+                    "Mooncake snapshot training does not yet support USP attention"
+                )
+            if (
+                self.training.tp_size != 1
+                or self.training.sp_ulysses_size != 1
+                or self.training.sp_ring_size != 1
+            ):
+                raise ValueError(
+                    "Mooncake snapshot training currently requires trainer TP/SP=1"
+                )
+            if self.training.accumulation_steps != 1:
+                raise ValueError(
+                    "Mooncake snapshot training currently requires "
+                    "accumulation_steps=1 for exact token normalization"
+                )
+            if self.training.loss_decay_gamma is not None:
+                raise ValueError(
+                    "Mooncake target-KV objective requires loss_decay_gamma=null"
+                )
 
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(
@@ -859,7 +929,11 @@ class Config(StrictConfigModel):
 
     @property
     def mode(self) -> str:
-        return "offline" if self.data.hidden_states_path else "online"
+        return (
+            "offline"
+            if self.data.hidden_states_path or self.data.mooncake_snapshots is not None
+            else "online"
+        )
 
     def validate_world_size(self, world_size: int) -> None:
         if world_size < 1:
@@ -929,6 +1003,7 @@ def load_config(path: str, overrides: Optional[List[str]] = None) -> Config:
 __all__ = [
     "ModelConfig",
     "DataConfig",
+    "MooncakeSnapshotDataConfig",
     "TrackingConfig",
     "ProfilingConfig",
     "RuntimeConfig",

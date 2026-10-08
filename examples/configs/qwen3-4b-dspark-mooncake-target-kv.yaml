@@ -1,0 +1,50 @@
+model:
+  target_model_path: Qwen/Qwen3-4B
+  # Export this DSparkTargetKVDraftModel checkpoint with the paired SGLang build.
+  # Its config.json contains the immutable target-KV contract.
+  draft_model_config: /checkpoints/qwen3-4b-dspark-target-kv
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  torch_dtype: bfloat16
+
+data:
+  max_length: 3072
+  dataloader_num_workers: 4
+  mooncake_snapshots:
+    # This is a metadata-only Catalog publication or claim export. Tensor bytes
+    # remain in Mooncake and are fetched after each manifest is verified.
+    refs_path: /datasets/dspark/publications.jsonl
+    metadata_server: http://mooncake-metadata:8080/metadata
+    master_server_addr: mooncake-master:50051
+    local_hostname: 10.0.0.24
+    protocol: rdma
+    rdma_devices: mlx5_0
+    local_buffer_size_bytes: 268435456
+    max_receive_bytes: 2147483648
+
+training:
+  strategy: dspark
+  num_epochs: 6
+  max_steps: 10000
+  batch_size: 1
+  accumulation_steps: 1
+  learning_rate: 6.0e-4
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: null
+  objective_chunk_blocks: 128
+  save_interval: 1000
+  log_interval: 50
+  seed: 42
+
+run_id: qwen3-4b-dspark-mooncake-target-kv
+output_dir: ./outputs/qwen3-4b-dspark-mooncake-target-kv
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1

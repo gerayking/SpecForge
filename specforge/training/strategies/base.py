@@ -466,6 +466,31 @@ class DSparkTrainStrategy(DraftTrainStrategy):
 
     def __init__(self, dspark_model: nn.Module) -> None:
         self.dspark_model = dspark_model
+        contract_model = dspark_model
+        if not hasattr(contract_model, "input_mode") and hasattr(
+            contract_model, "module"
+        ):
+            contract_model = contract_model.module
+        self.input_mode = getattr(contract_model, "input_mode", "target_hidden")
+        self.target_kv_contract = getattr(contract_model, "target_kv_contract", None)
+        if self.input_mode == "target_kv":
+            contract = self.target_kv_contract
+            if not isinstance(contract, dict):
+                raise ValueError("target-KV DSpark model has no feature contract")
+            self.required_features = {
+                "input_ids",
+                "position_ids",
+                "loss_mask",
+                "teacher_topk_ids",
+                "teacher_topk_logits",
+                "teacher_logsumexp",
+                "teacher_valid",
+                *{
+                    f"target_{component}.{layer['layer_id']}"
+                    for layer in contract["kv"]["layers"]
+                    for component in ("k", "v")
+                },
+            }
 
     def trainable_module(self) -> nn.Module:
         return self.dspark_model
@@ -479,12 +504,33 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
-        loss, accuracy, model_metrics = self.dspark_model(
-            input_ids=t["input_ids"].to(device),
-            hidden_states=t["hidden_states"].to(device),
-            loss_mask=t["loss_mask"].to(device),
-            target_last_hidden_states=t["target_last_hidden_states"].to(device),
-        )
+        if self.input_mode == "target_kv":
+            contract = self.target_kv_contract
+            target_kv = {
+                name: t[name].to(device)
+                for name in {
+                    f"target_{component}.{layer['layer_id']}"
+                    for layer in contract["kv"]["layers"]
+                    for component in ("k", "v")
+                }
+            }
+            loss, accuracy, model_metrics = self.dspark_model(
+                input_ids=t["input_ids"].to(device),
+                position_ids=t["position_ids"].to(device),
+                loss_mask=t["loss_mask"].to(device),
+                target_kv=target_kv,
+                teacher_topk_ids=t["teacher_topk_ids"].to(device),
+                teacher_topk_logits=t["teacher_topk_logits"].to(device),
+                teacher_logsumexp=t["teacher_logsumexp"].to(device),
+                teacher_valid=t["teacher_valid"].to(device),
+            )
+        else:
+            loss, accuracy, model_metrics = self.dspark_model(
+                input_ids=t["input_ids"].to(device),
+                hidden_states=t["hidden_states"].to(device),
+                loss_mask=t["loss_mask"].to(device),
+                target_last_hidden_states=t["target_last_hidden_states"].to(device),
+            )
         metrics = {
             "accuracy": accuracy.detach(),
         }
@@ -492,6 +538,7 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         for name in (
             "accuracy_denom",
             "ce_loss",
+            "tv_loss",
             "l1_loss",
             "confidence_loss",
             "confidence_abs_error",

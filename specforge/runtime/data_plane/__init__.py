@@ -20,6 +20,8 @@ __all__ = [
     "list_feature_files",
     "SharedDirFeatureStore",
     "MooncakeFeatureStore",
+    "MooncakeSnapshotFeatureStore",
+    "SnapshotRefReader",
     "AuthPolicy",
 ]
 
@@ -36,6 +38,8 @@ _EXPORT_MODULE = {
     "list_feature_files": "offline_reader",
     "SharedDirFeatureStore": "disaggregated",
     "MooncakeFeatureStore": "mooncake_store",
+    "MooncakeSnapshotFeatureStore": "training_snapshot",
+    "SnapshotRefReader": "training_snapshot",
     "AuthPolicy": "disaggregated",
 }
 

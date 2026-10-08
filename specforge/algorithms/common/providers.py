@@ -166,9 +166,16 @@ class DraftConfigProvider:
     target_defaults: TargetDerivedDraftDefaults | None = None
     expected_auto_map_model: str | None = None
     apply_overrides: Factory | None = None
+    alternative_architectures: FrozenSet[str] = frozenset()
 
     def __post_init__(self) -> None:
         _non_empty(self.architecture, field_name="architecture")
+        for architecture in self.alternative_architectures:
+            _non_empty(architecture, field_name="alternative_architectures")
+        if self.architecture in self.alternative_architectures:
+            raise ValueError(
+                "alternative_architectures must not repeat the default architecture"
+            )
         if self.expected_auto_map_model is not None:
             _non_empty(
                 self.expected_auto_map_model,

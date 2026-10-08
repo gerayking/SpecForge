@@ -42,6 +42,10 @@ class AlgorithmModelParts:
 
 
 def dflash_needs_input_tools(cfg: Config, draft_model: Any) -> bool:
+    from specforge.modeling.draft.target_kv import target_kv_contract
+
+    if target_kv_contract(draft_model.config) is not None:
+        return False
     method_config = getattr(draft_model.config, "dflash_config", None) or {}
     needs_mask_fallback = (
         cfg.model.mask_token_id is None and method_config.get("mask_token_id") is None
@@ -402,6 +406,25 @@ def build_dspark_model(
     _target_config: Any,
     tokenizer: Any,
 ) -> AlgorithmModelParts:
+    from specforge.modeling.draft.target_kv import target_kv_contract
+
+    if target_kv_contract(draft_model.config) is not None:
+        from specforge.algorithms.common.target_kv_model import (
+            OnlineTargetKVDSparkModel,
+        )
+
+        return _build_dflash_family_model(
+            cfg,
+            draft_model,
+            tokenizer,
+            lambda common: OnlineTargetKVDSparkModel(
+                **common,
+                dspark_ce_loss_alpha=1.0,
+                dspark_l1_loss_alpha=0.0,
+                dspark_confidence_head_alpha=0.0,
+            ),
+        )
+
     from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
 
     return _build_dflash_family_model(

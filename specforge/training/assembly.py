@@ -116,7 +116,7 @@ def _load_draft(cfg: Config, algorithm: AlgorithmRegistration):
     provider = algorithm.providers.model
     draft_config = resolve_draft_config(cfg, provider=provider.draft_config)
     draft_model = provider.build_draft(cfg, draft_config)
-    architecture = provider.draft_config.architecture
+    architecture = list(getattr(draft_config, "architectures", None) or [None])[0]
     expected_type = resolve_draft(architecture)
     if not isinstance(draft_model, expected_type):
         raise ValueError(
@@ -203,6 +203,22 @@ def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> Mode
     draft_vocab_size = int(
         getattr(draft_config, "draft_vocab_size", draft_config.vocab_size)
     )
+    from specforge.modeling.draft.target_kv import target_kv_contract
+
+    snapshot_contract = target_kv_contract(draft_config)
+    if snapshot_contract is not None:
+        expected_hidden_size = int(snapshot_contract["encoder"]["hidden_size"])
+        expected_vocab_size = int(snapshot_contract["teacher"]["vocab_size"])
+        if target_hidden_size != expected_hidden_size:
+            raise ValueError(
+                "target model hidden_size does not match the target-KV contract: "
+                f"{target_hidden_size} != {expected_hidden_size}"
+            )
+        if target_vocab_size != expected_vocab_size:
+            raise ValueError(
+                "target model vocab_size does not match the target-KV contract: "
+                f"{target_vocab_size} != {expected_vocab_size}"
+            )
 
     parts = provider.build_training_model(
         cfg, draft_model, draft_config, target_config, input_tools
@@ -616,29 +632,51 @@ def build_training_run(
         raise ValueError("colocated execution supports offline training only")
 
     bundle = build_model_bundle(cfg, algorithm=algorithm)
-    from specforge.launch import build_offline_runtime
+    from specforge.launch import (
+        _build_mooncake_snapshot_runtime,
+        build_offline_runtime,
+    )
 
-    _ensure_offline_vocab_mapping(cfg, bundle, algorithm)
     run_logger = _configured_logger(cfg)
     try:
-        trainer = build_offline_runtime(
-            hidden_states_path=cfg.data.hidden_states_path,
-            eval_hidden_states_path=cfg.data.eval_hidden_states_path or None,
-            draft_model=bundle.model,
-            target_head=bundle.target_head,
-            ttt_length=t.ttt_length,
-            max_len=cfg.data.max_length,
-            num_epochs=t.num_epochs,
-            use_usp_preprocess=(t.attention_backend == "usp"),
-            seed=t.seed,
-            resume_from=t.resume_from,
-            **_common_launch_kwargs(
+        if cfg.data.mooncake_snapshots is not None:
+            common = _common_launch_kwargs(
                 cfg,
                 bundle,
                 algorithm,
                 logger=run_logger,
-            ),
-        )
+            )
+            for unsupported in ("tp_size", "sp_ulysses_size", "sp_ring_size"):
+                common.pop(unsupported)
+            trainer = _build_mooncake_snapshot_runtime(
+                snapshot_config=cfg.data.mooncake_snapshots,
+                draft_model=bundle.model,
+                max_len=cfg.data.max_length,
+                num_epochs=t.num_epochs,
+                seed=t.seed,
+                resume_from=t.resume_from,
+                **common,
+            )
+        else:
+            _ensure_offline_vocab_mapping(cfg, bundle, algorithm)
+            trainer = build_offline_runtime(
+                hidden_states_path=cfg.data.hidden_states_path,
+                eval_hidden_states_path=cfg.data.eval_hidden_states_path or None,
+                draft_model=bundle.model,
+                target_head=bundle.target_head,
+                ttt_length=t.ttt_length,
+                max_len=cfg.data.max_length,
+                num_epochs=t.num_epochs,
+                use_usp_preprocess=(t.attention_backend == "usp"),
+                seed=t.seed,
+                resume_from=t.resume_from,
+                **_common_launch_kwargs(
+                    cfg,
+                    bundle,
+                    algorithm,
+                    logger=run_logger,
+                ),
+            )
     except BaseException:
         _close_configured_logger(run_logger)
         raise

@@ -104,6 +104,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "target_defaults",
                 "expected_auto_map_model",
                 "apply_overrides",
+                "alternative_architectures",
             },
             provider_fields,
         )
