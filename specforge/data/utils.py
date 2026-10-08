@@ -23,10 +23,10 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
+from datasets import Dataset
 from torch.utils.data import DataLoader, DistributedSampler
 
-from datasets import Dataset
-from specforge.distributed import get_draft_sp_group
+from specforge.distributed import get_draft_sp_group, get_sp_ulysses_group
 
 
 class DataCollatorWithPadding:
@@ -35,7 +35,14 @@ class DataCollatorWithPadding:
     """
 
     def __init__(self):
-        self.sp_degree = torch.distributed.get_world_size(get_draft_sp_group())
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            self.sp_degree = torch.distributed.get_world_size(get_draft_sp_group())
+            self.ulysses_degree = torch.distributed.get_world_size(
+                get_sp_ulysses_group()
+            )
+        else:
+            self.sp_degree = 1
+            self.ulysses_degree = 1
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         """
@@ -73,6 +80,29 @@ class DataCollatorWithPadding:
         outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
 
+    def padding_position_ids_3d(
+        self, position_ids: torch.Tensor, length: int
+    ) -> torch.Tensor:
+        """Pad position IDs on their final sequence dimension."""
+        if position_ids.ndim != 3:
+            raise ValueError(
+                "3D position_ids must have shape [axes, batch, sequence], got "
+                f"{tuple(position_ids.shape)}"
+            )
+        padding_length = length - position_ids.shape[-1]
+        if padding_length < 0:
+            raise ValueError(
+                f"cannot pad position_ids of length {position_ids.shape[-1]} "
+                f"to shorter length {length}"
+            )
+        padding = torch.zeros(
+            *position_ids.shape[:-1],
+            padding_length,
+            dtype=position_ids.dtype,
+            device=position_ids.device,
+        )
+        return torch.cat((position_ids, padding), dim=-1)
+
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Collate a batch of features.
@@ -90,10 +120,14 @@ class DataCollatorWithPadding:
                 - loss_mask: torch.Tensor of shape (B, N)
         """
         max_length = max(item["input_ids"].shape[1] for item in features)
+
         # pad for sequence parrel
         max_length = (
             (max_length + self.sp_degree - 1) // self.sp_degree
         ) * self.sp_degree
+        # position max len, ulysses do not need chuck position ids
+        position_max_len = max_length * self.ulysses_degree
+
         batch_input_ids = torch.cat(
             [self.paddingtensor2D(item["input_ids"], max_length) for item in features]
         )
@@ -103,9 +137,35 @@ class DataCollatorWithPadding:
                 for item in features
             ]
         )
-        batch_loss_mask = torch.cat(
-            [self.paddingtensor2D(item["loss_mask"], max_length) for item in features]
-        )
+        if features[0]["loss_mask"].ndim == 3:
+            batch_loss_mask = torch.cat(
+                [self.paddingtensor(item["loss_mask"], max_length) for item in features]
+            )
+        else:
+            batch_loss_mask = torch.cat(
+                [
+                    self.paddingtensor2D(item["loss_mask"], max_length)
+                    for item in features
+                ]
+            )
+        if "position_ids" in features[0]:
+            if features[0]["position_ids"].ndim == 3:
+                batch_position_ids = torch.cat(
+                    [
+                        self.padding_position_ids_3d(item["position_ids"], max_length)
+                        for item in features
+                    ],
+                    dim=1,
+                )
+            else:
+                batch_position_ids = torch.cat(
+                    [
+                        self.paddingtensor2D(item["position_ids"], position_max_len)
+                        for item in features
+                    ]
+                )
+        else:
+            batch_position_ids = None
         batch = {
             "input_ids": batch_input_ids,
             "attention_mask": batch_attention_mask,
@@ -113,115 +173,23 @@ class DataCollatorWithPadding:
             "hidden_state": None,
             "target": None,
         }
+        if batch_position_ids is not None:
+            batch["position_ids"] = batch_position_ids
         if all("hidden_state" in item for item in features):
             assert all(
                 "target" in item for item in features
             ), "target is required when hidden_state is provided"
-            batch["hidden_state"] = torch.cat(
-                [
-                    self.paddingtensor(item["hidden_state"], max_length)
-                    for item in features
-                ]
-            )
-            batch["target"] = torch.cat(
-                [self.paddingtensor(item["target"], max_length) for item in features]
-            )
-        return batch
-
-
-class VlmDataCollatorWithPadding:
-    """
-    Datacollator that will dynamically pad the inputs for batching.
-    """
-
-    def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
-        """
-        Pad to the longest sequence in the batch.
-
-        Args:
-            intensors: (B, n, S)
-            N: the length to pad to, N >= n
-
-        Returns:
-            outtensors: (B, N, S)
-        """
-        B, n, S = intensors.shape
-        padding_tensor = torch.zeros(B, N - n, S, dtype=intensors.dtype)
-        outtensors = torch.cat((intensors, padding_tensor), dim=1)
-        return outtensors
-
-    def paddingtensor2D(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
-        """
-        Pad 2D tensor to the longest sequence in the batch.
-
-        Args:
-            intensors: (B, n)
-            N: the length to pad to, N >= n
-
-        Returns:
-            outtensors: (B, N)
-        """
-        B, n = intensors.shape
-        padding_tensor = torch.zeros(B, N - n, dtype=intensors.dtype)
-        outtensors = torch.cat((intensors, padding_tensor), dim=1)
-        return outtensors
-
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Collate a batch of features.
-
-        Args:
-            features: A list of features, where each feature is a dictionary containing:
-                - input_ids: torch.Tensor of shape (n,)
-                - attention_mask: torch.Tensor of shape (n,)
-                - loss_mask: torch.Tensor of shape (n,)
-                - pixel_values: torch.Tensor of shape (grid_t * grid_h * grid_w, channel * temporal_patch_size * patch_size * patch_size)
-                - image_grid_thw: torch.Tensor of shape (3,)
-
-        Returns:
-            A dictionary containing:
-                - input_ids: torch.Tensor of shape (B, N)
-                - attention_mask: torch.Tensor of shape (B, N)
-                - loss_mask: torch.Tensor of shape (B, N)
-        """
-        max_length = max(item["input_ids"].shape[1] for item in features)
-        batch_input_ids = torch.cat(
-            [self.paddingtensor2D(item["input_ids"], max_length) for item in features]
-        )
-        batch_attention_mask = torch.cat(
-            [
-                self.paddingtensor2D(item["attention_mask"], max_length)
-                for item in features
-            ]
-        )
-        batch_loss_mask = torch.cat(
-            [self.paddingtensor2D(item["loss_mask"], max_length) for item in features]
-        )
-        batch_pixel_values = torch.cat(
-            [item["pixel_values"] for item in features], dim=0
-        )
-        batch_image_grid_thw = torch.cat(
-            [item["image_grid_thw"] for item in features], dim=0
-        )
-        batch = {
-            "input_ids": batch_input_ids,
-            "attention_mask": batch_attention_mask,
-            "loss_mask": batch_loss_mask,
-            "pixel_values": batch_pixel_values,
-            "image_grid_thw": batch_image_grid_thw,
-            "hidden_state": None,
-            "target": None,
-        }
-        if all("hidden_state" in item for item in features):
-            assert all(
-                "target" in item for item in features
-            ), "target is required when hidden_state is provided"
-            batch["hidden_state"] = torch.cat(
-                [
-                    self.paddingtensor(item["hidden_state"], max_length)
-                    for item in features
-                ]
-            )
+            if self.sp_degree > 1:  # USP mode
+                batch["hidden_state"] = torch.cat(
+                    [item["hidden_state"] for item in features]
+                )
+            else:
+                batch["hidden_state"] = torch.cat(
+                    [
+                        self.paddingtensor(item["hidden_state"], max_length)
+                        for item in features
+                    ]
+                )
             batch["target"] = torch.cat(
                 [self.paddingtensor(item["target"], max_length) for item in features]
             )
@@ -235,7 +203,6 @@ def prepare_dp_dataloaders(
     process_group: Optional[dist.ProcessGroup] = None,
     pin_memory: Optional[bool] = False,
     shuffle: Optional[bool] = False,
-    is_vlm: Optional[bool] = False,
     prefetch_factor: Optional[int] = 2,
     **dataloader_kwargs,
 ) -> DataLoader:
@@ -249,7 +216,6 @@ def prepare_dp_dataloaders(
         process_group: The process group for distributed training.
         pin_memory: Whether to pin memory for data loading.
         shuffle: Whether to shuffle the dataset.
-        is_vlm: Whether the dataset is a vision-language model dataset.
         **dataloader_kwargs: Additional keyword arguments for the DataLoader.
 
     Returns:
@@ -260,11 +226,6 @@ def prepare_dp_dataloaders(
     sampler = DistributedSampler(
         dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
     )
-    if is_vlm:
-        datacollator_cls = VlmDataCollatorWithPadding
-    else:
-        datacollator_cls = DataCollatorWithPadding
-
     if num_workers == 0:
         prefetch_factor = None
 
@@ -275,7 +236,7 @@ def prepare_dp_dataloaders(
         num_workers=num_workers,
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
-        collate_fn=datacollator_cls(),
+        collate_fn=DataCollatorWithPadding(),
         drop_last=True,
         **dataloader_kwargs,
     )

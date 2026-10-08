@@ -2,250 +2,277 @@ import os
 import unittest
 
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
-from accelerate.utils import set_seed
 from torch import nn
 from transformers import PretrainedConfig
-from yunchang import EXTRACT_FUNC_DICT
 
-# Project-specific imports
+from specforge.core.eagle3_adapters import SdpaLikeAdapter, UspAdapter
 from specforge.distributed import destroy_distributed, init_distributed
+from specforge.layers.ring import ring_flash_attn_func
 from specforge.modeling.draft.llama3_eagle import LlamaDecoderLayer
 from specforge.utils import padding
-from tests.utils import get_available_port
+from tests.utils import get_available_port, is_port_in_use
 
 
-def get_model_config():
-    """Create and return the model configuration."""
-    config_dict = {
-        "architectures": ["LlamaForCausalLMEagle3"],
-        "eagle_config": {
-            "eagle_aux_hidden_state_layer_ids": [1, 29, 57],
-            "use_aux_hidden_state": True,
-        },
-        "bos_token_id": 128000,
-        "eos_token_id": 128001,
-        "hidden_act": "silu",
-        "hidden_size": 7168,
-        "initializer_range": 0.02,
-        "intermediate_size": 29568,
-        "max_position_embeddings": 32768,
-        "model_type": "llama",
-        "num_attention_heads": 32,
-        "num_key_value_heads": 8,
-        "num_hidden_layers": 1,
-        "pad_token_id": 0,
-        "rms_norm_eps": 1e-05,
-        "tie_word_embeddings": False,
-        "torch_dtype": "float16",
-        "transformers_version": "4.28.1",
-        "use_cache": True,
-        "rope_scaling": None,
-        "vocab_size": 129280,
-        "draft_vocab_size": 32000,
-        "pretraining_tp": 1,
-    }
-    return PretrainedConfig.from_dict(config_dict)
+def _standard_flash_attn_available() -> bool:
+    """Both the FA golden path and USP require the standard FA interface."""
+    try:
+        from flash_attn import flash_attn_varlen_func  # noqa: F401
+        from flash_attn.bert_padding import pad_input, unpad_input  # noqa: F401
+        from flash_attn.flash_attn_interface import (  # noqa: F401
+            _flash_attn_varlen_backward,
+        )
+    except Exception:
+        return False
+    return True
 
 
-def setup_env(rank, world_size, port):
-    """Set up distributed environment variables."""
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(port)
+_HAS_FLASH_ATTN = _standard_flash_attn_available()
+_HAS_2_GPUS = torch.cuda.is_available() and torch.cuda.device_count() >= 2
+
+
+def _model_config() -> PretrainedConfig:
+    """Small but kernel-real Llama decoder config for the two-GPU gate."""
+    return PretrainedConfig.from_dict(
+        {
+            "architectures": ["LlamaForCausalLMEagle3"],
+            "hidden_act": "silu",
+            "hidden_size": 256,
+            "intermediate_size": 512,
+            "max_position_embeddings": 512,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "num_hidden_layers": 1,
+            "pad_token_id": 0,
+            "rms_norm_eps": 1e-5,
+            "rope_scaling": None,
+            "tie_word_embeddings": False,
+            "use_cache": True,
+            "vocab_size": 1024,
+            "draft_vocab_size": 512,
+            "pretraining_tp": 1,
+        }
+    )
+
+
+def _setup_worker(rank: int, world_size: int, port: int) -> torch.device:
+    os.environ.update(
+        {
+            "RANK": str(rank),
+            "LOCAL_RANK": str(rank),
+            "WORLD_SIZE": str(world_size),
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(port),
+            "SPECFORGE_DEVICE": "cuda",
+        }
+    )
     torch.cuda.set_device(rank)
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+    return torch.device("cuda", rank)
 
 
-def run_iterative_pass(
-    decoder_layer,
-    embed_tokens,
-    input_ids,
-    hidden_states,
-    attention_mask,
-    position_ids,
-    ttt_length,
-):
-    """
-    Core loop: execute the forward pass `ttt_length` times.
-    Used for both Golden (SDPA) and Distributed (USP) runs to ensure logic consistency.
-    """
-    # Clone to avoid side effects on original tensors
-    curr_input_ids = input_ids.clone()
-    curr_hidden_states = hidden_states.clone()
+def _input_steps(input_ids: torch.Tensor, ttt_length: int) -> list[torch.Tensor]:
+    """Build global shifted inputs before sharding to preserve rank boundaries."""
+    steps = []
+    current = input_ids
+    for _ in range(ttt_length):
+        steps.append(current)
+        current = padding(current, left=False)
+    return steps
 
-    # Init cache
+
+def _run_iterative_pass(
+    decoder_layer: LlamaDecoderLayer,
+    embed_tokens: nn.Embedding,
+    input_steps: list[torch.Tensor],
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> torch.Tensor:
     cache_hidden = [[], []]
-    past_key_values = None
-    final_output = None
-
-    for idx in range(ttt_length):
-        is_last = idx == ttt_length - 1
-
-        # 1. Embed inputs
-        inputs_embeds = embed_tokens(curr_input_ids).to(curr_hidden_states.dtype)
-
-        # 2. Forward pass
-        output_hidden_states = decoder_layer(
-            input_emb=inputs_embeds,
-            hidden_states=curr_hidden_states,
+    output = hidden_states
+    for input_ids in input_steps:
+        input_emb = embed_tokens(input_ids).to(output.dtype)
+        output = decoder_layer(
+            input_emb=input_emb,
+            hidden_states=output,
             cache_hidden=cache_hidden,
-            attention_mask=attention_mask,
+            attention_mask=None,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            past_key_values=None,
             output_attentions=False,
             use_cache=False,
         )
-
-        # Update states for next iteration
-        curr_hidden_states = output_hidden_states
-        final_output = output_hidden_states
-
-        # 3. Simulate TTT padding/shift
-        if not is_last:
-            curr_input_ids = padding(curr_input_ids, left=False)
-
-    return final_output
+    return output
 
 
-def run_test_case(rank, world_size, port):
-    """Worker function executed in each process."""
-    setup_env(rank, world_size, port)
-    device = torch.device(f"cuda:{rank}")
-    set_seed(42)
+def _local_sequence_shard(tensor: torch.Tensor, rank: int, world_size: int):
+    return tensor.chunk(world_size, dim=1)[rank].contiguous()
 
-    # --- Data & Config Preparation ---
-    config = get_model_config()
-    seq_len = 1560
-    batch_size = 1
+
+def _assert_adapter_contract(
+    *,
+    device: torch.device,
+    local_seq_len: int,
+    ttt_length: int,
+    sp_ulysses_size: int,
+) -> None:
+    """Exercise the canonical USP adapter with the real process groups."""
+    padded_len = local_seq_len + ttt_length
+    adapter = UspAdapter(object())
+    state = adapter.step_view(
+        idx=0,
+        ttt_length=ttt_length,
+        global_input_ids=torch.zeros((1, padded_len), dtype=torch.long, device=device),
+        attention_mask=torch.ones((1, padded_len), device=device),
+        loss_mask=torch.ones((1, padded_len, 1), device=device),
+        position_ids=torch.arange(
+            local_seq_len * sp_ulysses_size, device=device
+        ).unsqueeze(0),
+        hidden_states=torch.zeros((1, padded_len, 8), device=device),
+        target_p_padded=torch.zeros((1, padded_len, 8), device=device),
+        position_mask=torch.ones((1, padded_len, 1), device=device),
+        seq_length=padded_len,
+    )
+    assert state.input_ids.shape[1] == local_seq_len
+    assert state.hidden_states.shape[1] == local_seq_len
+    assert state.position_ids.shape[1] == local_seq_len * sp_ulysses_size
+
+
+def _run_decoder_parity(
+    rank: int, world_size: int, rendezvous_ports: tuple[int, int]
+) -> None:
+    device = _setup_worker(rank, world_size, rendezvous_ports[0])
+    config = _model_config()
+    seq_len = 128
     ttt_length = 3
 
-    # Generate dummy data on GPU
-    data_input_ids = torch.randint(0, 10000, (batch_size, seq_len), device=device)
-    data_hidden_states = torch.randn(
-        batch_size, seq_len, config.hidden_size, device=device, dtype=torch.bfloat16
+    input_ids = torch.randint(
+        0, config.vocab_size, (1, seq_len), dtype=torch.long, device=device
     )
-    attention_mask = torch.tril(torch.ones(seq_len, seq_len, device=device)).view(
-        1, 1, seq_len, seq_len
+    hidden_states = torch.randn(
+        (1, seq_len, config.hidden_size), dtype=torch.bfloat16, device=device
     )
-    position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+    position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0)
+    global_input_steps = _input_steps(input_ids, ttt_length)
 
-    # Shared embedding layer
     embed_tokens = nn.Embedding(
         config.vocab_size, config.hidden_size, config.pad_token_id
-    ).to(device)
-
-    # --- Phase 1: Golden Run (SDPA) ---
-    # Init dist briefly for internal checks, even if running single-device logic
-    init_distributed(tp_size=1, sp_ulysses_size=1, sp_ring_size=1)
-
-    sdpa_decoder = (
-        LlamaDecoderLayer(config, attention_backend="fa").to(device).to(torch.bfloat16)
+    ).to(device=device, dtype=torch.bfloat16)
+    golden_decoder = LlamaDecoderLayer(config, attention_backend="fa").to(
+        device=device, dtype=torch.bfloat16
     )
 
+    # The non-USP adapter remains the golden path's canonical view contract.
+    golden_state = SdpaLikeAdapter(object()).step_view(
+        idx=0,
+        ttt_length=ttt_length,
+        global_input_ids=input_ids,
+        attention_mask=torch.ones((1, seq_len), device=device),
+        loss_mask=torch.ones((1, seq_len, 1), device=device),
+        position_ids=position_ids,
+        hidden_states=hidden_states,
+        target_p_padded=torch.zeros((1, seq_len, 8), device=device),
+        position_mask=torch.ones((1, seq_len, 1), device=device),
+        seq_length=seq_len,
+    )
+    assert golden_state.input_ids.shape[1] == seq_len
+
     with torch.no_grad():
-        sdpa_output = run_iterative_pass(
-            decoder_layer=sdpa_decoder,
-            embed_tokens=embed_tokens,
-            input_ids=data_input_ids,
-            hidden_states=data_hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            ttt_length=ttt_length,
+        golden_output = _run_iterative_pass(
+            golden_decoder,
+            embed_tokens,
+            global_input_steps,
+            hidden_states,
+            position_ids,
         )
+    golden_state_dict = golden_decoder.state_dict()
+    del golden_decoder
 
-    # Save weights for alignment and cleanup SDPA model
-    state_dict = sdpa_decoder.state_dict()
-    del sdpa_decoder
-    destroy_distributed()
-
-    # --- Phase 2: Distributed Run (USP) ---
-    def subtest_usp(sp_ulysses_degree, sp_ring_degree):
-        """Run USP with specific topology and compare against Golden."""
+    topologies = ((2, 1), (1, 2))
+    for (sp_ulysses_size, sp_ring_size), rendezvous_port in zip(
+        topologies, rendezvous_ports, strict=True
+    ):
         try:
+            # Each topology creates and destroys a complete default process
+            # group. Reusing one TCPStore endpoint is racy, especially when
+            # TORCH_DISTRIBUTED_DEBUG=DETAIL adds its Gloo wrapper group.
+            os.environ["MASTER_PORT"] = str(rendezvous_port)
             init_distributed(
+                timeout=2,
                 tp_size=1,
-                sp_ulysses_size=sp_ulysses_degree,
-                sp_ring_size=sp_ring_degree,
+                sp_ulysses_size=sp_ulysses_size,
+                sp_ring_size=sp_ring_size,
+            )
+            assert callable(ring_flash_attn_func)
+            _assert_adapter_contract(
+                device=device,
+                local_seq_len=seq_len // world_size,
+                ttt_length=ttt_length,
+                sp_ulysses_size=sp_ulysses_size,
             )
 
-            # Init USP model and load golden weights
-            usp_decoder = (
-                LlamaDecoderLayer(config, attention_backend="usp")
-                .to(device)
-                .to(torch.bfloat16)
+            usp_decoder = LlamaDecoderLayer(config, attention_backend="usp").to(
+                device=device, dtype=torch.bfloat16
             )
-            usp_decoder.load_state_dict(state_dict)
+            usp_decoder.load_state_dict(golden_state_dict)
 
-            # Shard data (Split Input)
-            extract_func = EXTRACT_FUNC_DICT["basic"]
-
-            local_input_ids = (
-                extract_func(
-                    data_input_ids,
-                    rank,
-                    world_size=world_size,
-                    rd=sp_ring_degree,
-                    ud=sp_ulysses_degree,
+            local_input_steps = [
+                _local_sequence_shard(step, rank, world_size)
+                for step in global_input_steps
+            ]
+            local_hidden_states = _local_sequence_shard(hidden_states, rank, world_size)
+            if sp_ring_size > 1:
+                local_position_ids = _local_sequence_shard(
+                    position_ids, rank, world_size
                 )
-                .detach()
-                .clone()
-            )
+            else:
+                local_position_ids = position_ids
 
-            local_hidden_states = (
-                extract_func(
-                    data_hidden_states,
-                    rank,
-                    world_size=world_size,
-                    rd=sp_ring_degree,
-                    ud=sp_ulysses_degree,
-                )
-                .detach()
-                .clone()
-            )
-
-            # Run USP forward
             with torch.no_grad():
-                usp_output = run_iterative_pass(
-                    decoder_layer=usp_decoder,
-                    embed_tokens=embed_tokens,
-                    input_ids=local_input_ids,
-                    hidden_states=local_hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    ttt_length=ttt_length,
+                usp_output = _run_iterative_pass(
+                    usp_decoder,
+                    embed_tokens,
+                    local_input_steps,
+                    local_hidden_states,
+                    local_position_ids,
                 )
 
-            # Verify results
-            # Slice the golden output to match the current rank's chunk
-            total_degree = sp_ring_degree * sp_ulysses_degree
-            chunk_size = sdpa_output.shape[1] // total_degree
-            start_idx = (rank % total_degree) * chunk_size
-            end_idx = start_idx + chunk_size
-
-            golden_chunk = sdpa_output[:, start_idx:end_idx, :]
-
-            assert torch.allclose(usp_output, golden_chunk, rtol=2e-2, atol=2e-2), (
-                f"[Rank {rank}] USP (U{sp_ulysses_degree}R{sp_ring_degree}) mismatch!\n"
-                f"Max Diff: {(usp_output - golden_chunk).abs().max().item()}"
+            expected = _local_sequence_shard(golden_output, rank, world_size)
+            max_diff = (usp_output - expected).abs().max().item()
+            assert torch.allclose(usp_output, expected, rtol=2e-2, atol=2e-2), (
+                f"rank={rank} USP U{sp_ulysses_size}R{sp_ring_size} decoder "
+                f"mismatch; max_diff={max_diff}"
             )
-
+            # This is a device-less NCCL collective, so identify the GPU
+            # explicitly instead of asking NCCL to infer it from global rank.
+            dist.barrier(device_ids=[rank])
         finally:
             destroy_distributed()
 
-    # Case 1: Hybrid (Ulysses=2, Ring=1)
-    subtest_usp(sp_ulysses_degree=2, sp_ring_degree=1)
 
-    # Case 2: Hybrid (Ulysses=1, Ring=2)
-    subtest_usp(sp_ulysses_degree=1, sp_ring_degree=2)
-
-
-class TestTTTDistributed(unittest.TestCase):
-    def test_llama_usp_decoder(self):
+class TestDecoderParity(unittest.TestCase):
+    @unittest.skipUnless(
+        _HAS_FLASH_ATTN,
+        "standard flash-attn forward/backward and padding interfaces are required",
+    )
+    @unittest.skipUnless(_HAS_2_GPUS, "requires at least two CUDA devices")
+    def test_two_gpu_usp_decoder_matches_flash_attention(self):
         world_size = 2
-        port = get_available_port()
-        mp.spawn(run_test_case, nprocs=world_size, args=(world_size, port))
+        first_port = get_available_port()
+        second_port = first_port + 1
+        while second_port < 65535 and is_port_in_use(second_port):
+            second_port += 1
+        if second_port == 65535:
+            self.fail("could not find a second rendezvous port")
+        mp.spawn(
+            _run_decoder_parity,
+            nprocs=world_size,
+            args=(world_size, (first_port, second_port)),
+            join=True,
+        )
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)
