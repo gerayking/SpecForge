@@ -111,7 +111,7 @@ def _validate_world_size(cfg: Config, world_size: int) -> None:
 
 
 def _train(resolved) -> int:
-    from accelerate.utils import set_seed
+    from transformers import set_seed
 
     cfg = resolved.config
     # Make the typed recipe authoritative for the backend's existing FSDP

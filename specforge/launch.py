@@ -678,14 +678,23 @@ def _build_mooncake_snapshot_runtime(
     )
     from specforge.runtime.data_plane.training_snapshot import (
         MooncakeSnapshotFeatureStore,
+        SnapshotArchiveFeatureStore,
+        SnapshotArchiveRefReader,
         SnapshotRefReader,
     )
 
-    source_refs = SnapshotRefReader(
-        snapshot_config.refs_path,
-        run_id=run_id,
-        strategy=algorithm.name,
-    ).read()
+    if snapshot_config.archive_path:
+        source_refs = SnapshotArchiveRefReader(
+            snapshot_config.archive_path,
+            run_id=run_id,
+            strategy=algorithm.name,
+        ).read()
+    else:
+        source_refs = SnapshotRefReader(
+            snapshot_config.refs_path,
+            run_id=run_id,
+            strategy=algorithm.name,
+        ).read()
 
     def refs_for_epoch(epoch):
         return _shard_offline_refs(
@@ -696,20 +705,26 @@ def _build_mooncake_snapshot_runtime(
         )
 
     refs = refs_for_epoch(0)
-    setup_kwargs = {
-        "local_hostname": snapshot_config.local_hostname,
-        "metadata_server": snapshot_config.metadata_server,
-        "master_server_addr": snapshot_config.master_server_addr,
-        "protocol": snapshot_config.protocol,
-        "rdma_devices": snapshot_config.rdma_devices,
-        "global_segment_size": snapshot_config.global_segment_size_bytes,
-        "local_buffer_size": snapshot_config.local_buffer_size_bytes,
-    }
-    store = MooncakeSnapshotFeatureStore(
-        setup_kwargs=setup_kwargs,
-        max_receive_bytes=snapshot_config.max_receive_bytes,
-        expected_contract=contract,
-    )
+    if snapshot_config.archive_path:
+        store = SnapshotArchiveFeatureStore(
+            max_receive_bytes=snapshot_config.max_receive_bytes,
+            expected_contract=contract,
+        )
+    else:
+        setup_kwargs = {
+            "local_hostname": snapshot_config.local_hostname,
+            "metadata_server": snapshot_config.metadata_server,
+            "master_server_addr": snapshot_config.master_server_addr,
+            "protocol": snapshot_config.protocol,
+            "rdma_devices": snapshot_config.rdma_devices,
+            "global_segment_size": snapshot_config.global_segment_size_bytes,
+            "local_buffer_size": snapshot_config.local_buffer_size_bytes,
+        }
+        store = MooncakeSnapshotFeatureStore(
+            setup_kwargs=setup_kwargs,
+            max_receive_bytes=snapshot_config.max_receive_bytes,
+            expected_contract=contract,
+        )
     controller = DataFlowController(
         run_id,
         metadata_store=NoOpMetadataStore(),

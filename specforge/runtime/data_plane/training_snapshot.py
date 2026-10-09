@@ -521,6 +521,191 @@ def _publication_records(path: str) -> Iterable[dict]:
     )
 
 
+def _archive_file(root: Path, value: Any, name: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise SnapshotContractError(f"archive {name} path must be non-empty")
+    root = root.resolve()
+    candidate = (root / value).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise SnapshotContractError(f"archive {name} escapes the archive root") from exc
+    if not candidate.is_file():
+        raise SnapshotContractError(f"archive {name} does not exist: {candidate}")
+    return candidate
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+class SnapshotArchiveRefReader:
+    """Read refs from a durable capture archive without a live Catalog."""
+
+    def __init__(self, path: str, *, run_id: str, strategy: str = "dspark") -> None:
+        self.path = path
+        self.run_id = run_id
+        self.strategy = strategy
+
+    def read(self) -> list[SampleRef]:
+        root = Path(self.path).resolve()
+        index_path = root / "index.json"
+        try:
+            index = json.loads(index_path.read_bytes())
+        except FileNotFoundError as exc:
+            raise SnapshotContractError(
+                f"snapshot archive has no index.json: {root}"
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise SnapshotContractError(
+                "snapshot archive index is invalid JSON"
+            ) from exc
+        if not isinstance(index, list) or not index:
+            raise SnapshotContractError(
+                "snapshot archive index must be a non-empty list"
+            )
+
+        refs = []
+        identities = set()
+        for entry in index:
+            entry = _require_dict(entry, "archive index entry")
+            manifest_path = _archive_file(root, entry.get("manifest"), "manifest")
+            tensors_path = _archive_file(root, entry.get("tensors"), "tensor")
+            manifest_bytes = manifest_path.read_bytes()
+            manifest_digest = _sha256(manifest_bytes)
+            expected_manifest_digest = _require_digest(
+                entry.get("manifest_sha256"), "archive manifest digest"
+            )
+            if manifest_digest != expected_manifest_digest:
+                raise SnapshotContractError(
+                    f"archive manifest checksum mismatch: {manifest_path}"
+                )
+            expected_tensor_digest = _require_digest(
+                entry.get("tensors_sha256"), "archive tensor file digest"
+            )
+            if _sha256_file(tensors_path) != expected_tensor_digest:
+                raise SnapshotContractError(
+                    f"archive tensor file checksum mismatch: {tensors_path}"
+                )
+            manifest = decode_manifest(manifest_bytes)
+            identity = (
+                manifest["dataset_id"],
+                manifest["sample_id"],
+                manifest["generation_id"],
+            )
+            if identity in identities:
+                raise SnapshotContractError("duplicate archive manifest identity")
+            identities.add(identity)
+            dataset_id, sample_id, generation_id = identity
+            refs.append(
+                SampleRef(
+                    sample_id=f"{dataset_id}:{sample_id}:{generation_id}",
+                    run_id=self.run_id,
+                    source_task_id=None,
+                    feature_store_uri=f"snapshot-archive://{manifest_path}",
+                    feature_keys={},
+                    feature_specs={},
+                    strategy=self.strategy,
+                    target_model_version="manifest-bound",
+                    tokenizer_version="manifest-bound",
+                    num_tokens=int(manifest["sequence"]["total_length"]),
+                    estimated_bytes=int(manifest["total_tensor_bytes"]),
+                    metadata={
+                        "payload_format": PAYLOAD_FORMAT,
+                        "contract_id": CONTRACT_ID,
+                        "dataset_id": dataset_id,
+                        "manifest_sample_id": sample_id,
+                        "generation_id": generation_id,
+                        "manifest_path": str(manifest_path),
+                        "manifest_sha256": manifest_digest,
+                        "manifest_nbytes": len(manifest_bytes),
+                        "tensors_path": str(tensors_path),
+                        "tensors_sha256": expected_tensor_digest,
+                        "target_repr": "topk_logits_lse",
+                    },
+                )
+            )
+        return refs
+
+
+def _validate_expected_contract(
+    manifest: Mapping[str, Any], contract: Mapping[str, Any]
+) -> None:
+    if not contract:
+        return
+    if contract.get("input_mode") != "target_kv":
+        raise SnapshotContractError("draft checkpoint is not a target-KV model")
+    if contract.get("teacher") != manifest["teacher"]:
+        raise SnapshotContractError("snapshot teacher differs from draft contract")
+    expected_kv = contract.get("kv")
+    if not isinstance(expected_kv, dict):
+        raise SnapshotContractError("draft target-KV contract has no KV spec")
+    semantic_fields = (
+        "codec",
+        "dtype",
+        "selected_layer_ids",
+        "layers",
+        "source_k_stage",
+        "source_k_norm",
+        "rope_config",
+        "rope_config_sha256",
+        "layout",
+        "layer_numbering",
+        "validity_policy",
+    )
+    mismatches = [
+        field
+        for field in semantic_fields
+        if expected_kv.get(field) != manifest["kv"].get(field)
+    ]
+    if mismatches:
+        raise SnapshotContractError(
+            f"snapshot KV differs from draft contract: {mismatches}"
+        )
+
+
+def _materialize_features(
+    manifest: Mapping[str, Any], objects: Mapping[str, torch.Tensor]
+) -> Dict[str, torch.Tensor]:
+    features: Dict[str, torch.Tensor] = {}
+    total_length = manifest["sequence"]["total_length"]
+    geometries = {layer["layer_id"]: layer for layer in manifest["kv"]["layers"]}
+    for descriptor in manifest["objects"]:
+        if descriptor["kind"] == "aux":
+            features[descriptor["name"]] = objects[descriptor["key"]]
+    for layer_id in manifest["kv"]["selected_layer_ids"]:
+        geometry = geometries[layer_id]
+        for component in ("k", "v"):
+            dimension = (
+                geometry["key_head_dim"]
+                if component == "k"
+                else geometry["value_head_dim"]
+            )
+            output = torch.zeros(
+                total_length,
+                geometry["num_kv_heads"],
+                dimension,
+                dtype=_DTYPES[manifest["kv"]["dtype"]],
+            )
+            for descriptor in manifest["objects"]:
+                if (
+                    descriptor["kind"] == "kv"
+                    and descriptor["layer_id"] == layer_id
+                    and descriptor["component"] == component
+                ):
+                    token_start, token_stop = descriptor["token_range"]
+                    head_start, head_stop = descriptor["head_range"]
+                    output[token_start:token_stop, head_start:head_stop].copy_(
+                        objects[descriptor["key"]]
+                    )
+            features[f"target_{component}.{layer_id}"] = output
+    return features
+
+
 class SnapshotRefReader:
     """Convert Catalog claim/publication metadata into tensor-free SampleRefs."""
 
@@ -714,76 +899,13 @@ class MooncakeSnapshotFeatureStore(FeatureStore):
         return manifest
 
     def _validate_expected_contract(self, manifest: Mapping[str, Any]) -> None:
-        contract = self.expected_contract
-        if not contract:
-            return
-        if contract.get("input_mode") != "target_kv":
-            raise SnapshotContractError("draft checkpoint is not a target-KV model")
-        if contract.get("teacher") != manifest["teacher"]:
-            raise SnapshotContractError("snapshot teacher differs from draft contract")
-        expected_kv = contract.get("kv")
-        if not isinstance(expected_kv, dict):
-            raise SnapshotContractError("draft target-KV contract has no KV spec")
-        semantic_fields = (
-            "codec",
-            "dtype",
-            "selected_layer_ids",
-            "layers",
-            "source_k_stage",
-            "source_k_norm",
-            "rope_config",
-            "rope_config_sha256",
-            "layout",
-            "layer_numbering",
-            "validity_policy",
-        )
-        mismatches = [
-            field
-            for field in semantic_fields
-            if expected_kv.get(field) != manifest["kv"].get(field)
-        ]
-        if mismatches:
-            raise SnapshotContractError(
-                f"snapshot KV differs from draft contract: {mismatches}"
-            )
+        _validate_expected_contract(manifest, self.expected_contract)
 
     @staticmethod
     def _materialize_features(
         manifest: Mapping[str, Any], objects: Mapping[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        features: Dict[str, torch.Tensor] = {}
-        total_length = manifest["sequence"]["total_length"]
-        geometries = {layer["layer_id"]: layer for layer in manifest["kv"]["layers"]}
-        for descriptor in manifest["objects"]:
-            if descriptor["kind"] == "aux":
-                features[descriptor["name"]] = objects[descriptor["key"]]
-        for layer_id in manifest["kv"]["selected_layer_ids"]:
-            geometry = geometries[layer_id]
-            for component in ("k", "v"):
-                dimension = (
-                    geometry["key_head_dim"]
-                    if component == "k"
-                    else geometry["value_head_dim"]
-                )
-                output = torch.zeros(
-                    total_length,
-                    geometry["num_kv_heads"],
-                    dimension,
-                    dtype=_DTYPES[manifest["kv"]["dtype"]],
-                )
-                for descriptor in manifest["objects"]:
-                    if (
-                        descriptor["kind"] == "kv"
-                        and descriptor["layer_id"] == layer_id
-                        and descriptor["component"] == component
-                    ):
-                        token_start, token_stop = descriptor["token_range"]
-                        head_start, head_stop = descriptor["head_range"]
-                        output[token_start:token_stop, head_start:head_stop].copy_(
-                            objects[descriptor["key"]]
-                        )
-                features[f"target_{component}.{layer_id}"] = output
-        return features
+        return _materialize_features(manifest, objects)
 
     def get(
         self,
@@ -857,10 +979,129 @@ class MooncakeSnapshotFeatureStore(FeatureStore):
             self._closed = True
 
 
+class SnapshotArchiveFeatureStore(FeatureStore):
+    """Read and validate captured snapshots from a durable safetensors archive."""
+
+    def __init__(
+        self,
+        *,
+        max_receive_bytes: int = 2 << 30,
+        expected_contract: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        if max_receive_bytes <= 0:
+            raise ValueError("max_receive_bytes must be positive")
+        self.max_receive_bytes = int(max_receive_bytes)
+        self.expected_contract = dict(expected_contract or {})
+        self._active: Dict[str, FeatureHandle] = {}
+        self._counter = 0
+        self._lock = threading.RLock()
+        self._closed = False
+
+    def put(self, tensors, *, sample_id, metadata):
+        raise TypeError("SnapshotArchiveFeatureStore is read-only")
+
+    def get(
+        self,
+        sample_ref: SampleRef,
+        *,
+        device: "torch.device | str" = "cpu",
+        names: Optional[list[str]] = None,
+    ) -> Tuple[Dict[str, torch.Tensor], FeatureHandle]:
+        if names is not None:
+            raise ValueError("snapshot reads materialize one complete validated sample")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("SnapshotArchiveFeatureStore is closed")
+            metadata = sample_ref.metadata
+            manifest_path = Path(metadata["manifest_path"])
+            manifest_bytes = manifest_path.read_bytes()
+            if len(manifest_bytes) != metadata["manifest_nbytes"]:
+                raise SnapshotContractError("archive manifest size mismatch")
+            if _sha256(manifest_bytes) != metadata["manifest_sha256"]:
+                raise SnapshotContractError("archive manifest digest mismatch")
+            manifest = decode_manifest(
+                manifest_bytes, max_tensor_bytes=self.max_receive_bytes
+            )
+            identity = (
+                manifest["dataset_id"],
+                manifest["sample_id"],
+                manifest["generation_id"],
+            )
+            expected = (
+                metadata["dataset_id"],
+                metadata["manifest_sample_id"],
+                metadata["generation_id"],
+            )
+            if identity != expected:
+                raise SnapshotContractError(
+                    "archive reference and manifest identities differ"
+                )
+            _validate_expected_contract(manifest, self.expected_contract)
+
+            try:
+                from safetensors import safe_open
+            except ImportError as exc:
+                raise RuntimeError(
+                    "snapshot archive training requires safetensors"
+                ) from exc
+            expected_keys = {obj["key"] for obj in manifest["objects"]}
+            with safe_open(
+                metadata["tensors_path"], framework="pt", device="cpu"
+            ) as archive:
+                if set(archive.keys()) != expected_keys:
+                    raise SnapshotContractError(
+                        "archive tensor object set differs from manifest"
+                    )
+                objects = {key: archive.get_tensor(key) for key in expected_keys}
+            validate_tensors(manifest, objects)
+            tensors = _materialize_features(manifest, objects)
+            if str(device) != "cpu":
+                tensors = {name: tensor.to(device) for name, tensor in tensors.items()}
+            self._counter += 1
+            handle = FeatureHandle(
+                sample_id=sample_ref.sample_id,
+                generation=self._counter,
+                lease_token=f"snapshot-archive:{self._counter}:{sample_ref.sample_id}",
+            )
+            self._active[handle.lease_token] = handle
+            return tensors, handle
+
+    def release(self, handle: FeatureHandle, *, reason: str = "consumed") -> None:
+        del reason
+        with self._lock:
+            self._active.pop(handle.lease_token, None)
+
+    def abort(self, sample_id: str, *, reason: str = "aborted") -> None:
+        del reason
+        with self._lock:
+            for token, handle in list(self._active.items()):
+                if handle.sample_id == sample_id:
+                    self._active.pop(token, None)
+
+    def gc(self) -> dict:
+        return {"force_freed": 0, "force_freed_bytes": 0}
+
+    def health(self) -> dict:
+        with self._lock:
+            return {
+                "active_leases": len(self._active),
+                "retention_owner": "snapshot_archive",
+                "read_only": True,
+            }
+
+    def close(self) -> None:
+        with self._lock:
+            if self._active:
+                raise RuntimeError("cannot close snapshot archive with active reads")
+            self._closed = True
+
+
 __all__ = [
     "CONTRACT_ID",
     "PAYLOAD_FORMAT",
     "MooncakeSnapshotFeatureStore",
+    "SnapshotArchiveFeatureStore",
+    "SnapshotArchiveRefReader",
     "SnapshotContractError",
     "SnapshotRefReader",
     "SnapshotTransportError",

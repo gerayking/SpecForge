@@ -63,3 +63,23 @@ data-parallel ranks and batch sizes greater than one remain supported. The
 publication set is fixed at startup. Continuous Catalog claim/lease/ACK and
 checkpoint-driven garbage collection require a future Catalog consumer API;
 until then, create a stable publication export and pin its objects for the run.
+
+## Train from a durable archive
+
+For a capture that has been persisted as `index.json`, per-sample
+`manifest.json`, and `tensors.safetensors`, replace the live endpoint fields
+with one path:
+
+```yaml
+data:
+  max_length: 3072
+  mooncake_snapshots:
+    archive_path: /datasets/qwen35-capture/snapshot-archive
+    max_receive_bytes: 2147483648
+```
+
+`archive_path` and `refs_path` are mutually exclusive. The archive reader
+validates the index file digests, every manifest, every tensor descriptor, and
+every tensor checksum before a sample enters the training batch. It uses the
+same target-KV model contract and `CE + lambda_tv * TV128` objective as the
+live Mooncake reader.

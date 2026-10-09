@@ -1,0 +1,134 @@
+{
+  "architectures": [
+    "DSparkTargetKVDraftModel"
+  ],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "block_size": 16,
+  "bos_token_id": 248043,
+  "dflash_config": {
+    "attention_mode": "gqa",
+    "confidence_head_alpha": 0.0,
+    "confidence_head_with_markov": false,
+    "enable_confidence_head": false,
+    "markov_head_type": "vanilla",
+    "markov_rank": 256,
+    "mask_token_id": 248070,
+    "projector_type": "dspark",
+    "target_layer_ids": [3, 7, 11, 15, 19, 23, 27, 31]
+  },
+  "dtype": "bfloat16",
+  "enable_confidence_head": false,
+  "eos_token_id": 248044,
+  "head_dim": 128,
+  "hidden_act": "silu",
+  "hidden_size": 2560,
+  "initializer_range": 0.02,
+  "input_mode": "target_kv",
+  "intermediate_size": 9728,
+  "layer_types": [
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention"
+  ],
+  "markov_head_type": "vanilla",
+  "markov_rank": 256,
+  "mask_token_id": 248070,
+  "max_position_embeddings": 262144,
+  "max_window_layers": 5,
+  "model_type": "qwen3",
+  "num_attention_heads": 32,
+  "num_hidden_layers": 5,
+  "num_key_value_heads": 8,
+  "num_target_layers": 32,
+  "pad_token_id": 248044,
+  "rms_norm_eps": 1e-06,
+  "rope_scaling": null,
+  "rope_theta": 10000000,
+  "sliding_window": null,
+  "target_kv_contract": {
+    "architecture_revision": "dspark_target_kv_v1",
+    "compatibility": {
+      "serving_contract": "sglang_dspark_target_kv_v1",
+      "sglang_revision": "1aca8f73d8432a5aa46da57f0a612cfcd4537805",
+      "specforge_revision": "361b6b3"
+    },
+    "encoder": {
+      "bias": false,
+      "hidden_size": 2560,
+      "norm_semantics": "fp32_variance_and_weight_then_cast",
+      "rms_norm_eps": 1e-06
+    },
+    "feature_k_stage": "pre_rope",
+    "feature_order": "layer_then_k_v_head_dim",
+    "input_mode": "target_kv",
+    "kv": {
+      "codec": "dense_bf16_post_rope_v1",
+      "dtype": "bfloat16",
+      "layer_numbering": "target_attention_layer_zero_based",
+      "layers": [
+        {"key_head_dim": 256, "layer_id": 3, "num_kv_heads": 4, "value_head_dim": 256},
+        {"key_head_dim": 256, "layer_id": 7, "num_kv_heads": 4, "value_head_dim": 256},
+        {"key_head_dim": 256, "layer_id": 11, "num_kv_heads": 4, "value_head_dim": 256},
+        {"key_head_dim": 256, "layer_id": 15, "num_kv_heads": 4, "value_head_dim": 256},
+        {"key_head_dim": 256, "layer_id": 19, "num_kv_heads": 4, "value_head_dim": 256},
+        {"key_head_dim": 256, "layer_id": 23, "num_kv_heads": 4, "value_head_dim": 256},
+        {"key_head_dim": 256, "layer_id": 27, "num_kv_heads": 4, "value_head_dim": 256},
+        {"key_head_dim": 256, "layer_id": 31, "num_kv_heads": 4, "value_head_dim": 256}
+      ],
+      "layout": "token_head_dim",
+      "rope_config": {
+        "interleaved": false,
+        "rotary_dim": 64,
+        "scaling": null,
+        "theta": 10000000.0,
+        "type": "default"
+      },
+      "rope_config_sha256": "c32d04933290550bcc9812158de508d481ea2416e996626eadefa6e6670e8f25",
+      "selected_layer_ids": [3, 7, 11, 15, 19, 23, 27, 31],
+      "source_k_norm": "{\"epsilon\":1e-06,\"stage\":\"before_rope\",\"type\":\"rmsnorm\"}",
+      "source_k_stage": "post_rope",
+      "validity_policy": "all_selected_layers_per_valid_token"
+    },
+    "schema_version": 1,
+    "sequence": {
+      "backbone_input": "anchor_then_masks",
+      "context_boundary": "strictly_before_anchor",
+      "input_length": 16,
+      "label_shift": 1,
+      "markov_previous": "anchor_then_previous_labels",
+      "mask_token_id": 248070,
+      "position_semantics": "actual_target_positions",
+      "prediction_count": 16
+    },
+    "teacher": {
+      "adapter_revision": null,
+      "fingerprint_sha256": "6409c6a322a722c4fdf1f6c5d86c8613d96e7c5bf40bd7b862a4887cff0542ae",
+      "model_id": "/gpfs/models/huggingface.co/Qwen/Qwen3.5-4B",
+      "output_transform": "{\"final_logit_softcapping\":null,\"logit_scale\":null}",
+      "tokenizer_revision": "c6b0ffc8845a005cf4e8b67316d112749b06d5ee2adf528f587de84c1fa6394f",
+      "vocab_size": 248320,
+      "weights_revision": "c5817d782f11ff0821c479af5fa52cf1cba4ebae065ba372ed7c142a721fb60d"
+    },
+    "training": {
+      "base_logits_dtype": "float32",
+      "confidence_policy": "disabled",
+      "lambda_tv": 1.0,
+      "objective": "ce_tv128_full_vocabulary_lse_t1_v1",
+      "shared_head_transform_placement": "before_markov",
+      "shared_modules": "frozen_target_reference",
+      "tv_tail_policy": "omit_tail_without_renormalization"
+    },
+    "validation": {
+      "golden_fixture_sha256": "c232280bff3a59ae814b5d55718df91f354a8071af5e4300b210dec08a2c5bd0",
+      "parity_atol": 1e-05,
+      "parity_rtol": 1e-05
+    }
+  },
+  "tie_word_embeddings": false,
+  "use_cache": true,
+  "use_sliding_window": false,
+  "vocab_size": 248320
+}

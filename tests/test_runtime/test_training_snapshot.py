@@ -16,6 +16,8 @@ from specforge.algorithms.common.target_kv_data import (
 )
 from specforge.runtime.data_plane.training_snapshot import (
     MooncakeSnapshotFeatureStore,
+    SnapshotArchiveFeatureStore,
+    SnapshotArchiveRefReader,
     SnapshotContractError,
     SnapshotRefReader,
 )
@@ -242,6 +244,54 @@ class _UnregisterFailureStore(_FakeMooncakeStore):
 
 
 class TestTrainingSnapshot(unittest.TestCase):
+    def test_snapshot_archive_to_validated_training_batch(self):
+        from safetensors.torch import save_file
+
+        payloads, publication, source, contract = _snapshot()
+        manifest_bytes = payloads[publication["manifest_key"]]
+        manifest = json.loads(manifest_bytes)
+        archived_tensors = {}
+        dtype_by_name = {
+            "int32": torch.int32,
+            "int64": torch.int64,
+            "uint8": torch.uint8,
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }
+        for descriptor in manifest["objects"]:
+            archived_tensors[descriptor["key"]] = torch.frombuffer(
+                bytearray(payloads[descriptor["key"]]),
+                dtype=dtype_by_name[descriptor["dtype"]],
+            ).reshape(descriptor["shape"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sample = root / "sample-000000"
+            sample.mkdir()
+            manifest_path = sample / "manifest.json"
+            tensors_path = sample / "tensors.safetensors"
+            manifest_path.write_bytes(manifest_bytes)
+            save_file(archived_tensors, tensors_path)
+            index = [
+                {
+                    "sample_index": 0,
+                    "manifest": str(manifest_path.relative_to(root)),
+                    "manifest_sha256": _sha256(manifest_bytes),
+                    "tensors": str(tensors_path.relative_to(root)),
+                    "tensors_sha256": _sha256(tensors_path.read_bytes()),
+                    "tensor_objects": len(archived_tensors),
+                }
+            ]
+            (root / "index.json").write_text(json.dumps(index))
+            ref = SnapshotArchiveRefReader(str(root), run_id="run-1").read()[0]
+            store = SnapshotArchiveFeatureStore(expected_contract=contract)
+            raw, handle = store.get(ref)
+            self.assertTrue(torch.equal(raw["target_k.1"][:4], source["target_k.1"]))
+            self.assertTrue(torch.equal(raw["target_k.1"][4], torch.zeros(2, 4)))
+            store.release(handle)
+            store.close()
+
     def test_failed_unregister_keeps_backing_buffer_alive(self):
         payloads, publication, _source, contract = _snapshot()
         store = MooncakeSnapshotFeatureStore(

@@ -115,6 +115,22 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             Config.model_validate(invalid)
 
+    def test_snapshot_archive_is_mutually_exclusive_with_live_mooncake(self):
+        archive = _mooncake_snapshot_payload()
+        archive["data"]["mooncake_snapshots"] = {
+            "archive_path": "/data/snapshot-archive"
+        }
+        config = Config.model_validate(archive)
+        self.assertEqual(
+            config.data.mooncake_snapshots.archive_path,
+            "/data/snapshot-archive",
+        )
+
+        both = _mooncake_snapshot_payload()
+        both["data"]["mooncake_snapshots"]["archive_path"] = "/data/archive"
+        with self.assertRaises(ValidationError):
+            Config.model_validate(both)
+
     def test_liger_kernel_flag_is_typed_and_defaults_off(self):
         default = Config.model_validate(copy.deepcopy(MINIMAL))
         self.assertFalse(default.model.use_liger_kernel)

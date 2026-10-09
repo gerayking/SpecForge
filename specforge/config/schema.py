@@ -123,11 +123,12 @@ class ModelConfig(StrictConfigModel):
 
 
 class MooncakeSnapshotDataConfig(StrictConfigModel):
-    """Published SGLang snapshot references and the Mooncake reader endpoint."""
+    """Published snapshots in live Mooncake or a durable snapshot archive."""
 
-    refs_path: str
-    metadata_server: str
-    master_server_addr: str
+    refs_path: Optional[str] = None
+    archive_path: Optional[str] = None
+    metadata_server: Optional[str] = None
+    master_server_addr: Optional[str] = None
     local_hostname: str = "127.0.0.1"
     protocol: Literal["tcp", "rdma"] = "tcp"
     rdma_devices: str = ""
@@ -137,16 +138,25 @@ class MooncakeSnapshotDataConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_snapshot_endpoint(self):
-        for name in (
-            "refs_path",
-            "metadata_server",
-            "master_server_addr",
-            "local_hostname",
-        ):
+        if bool(self.refs_path) == bool(self.archive_path):
+            raise ValueError(
+                "data.mooncake_snapshots requires exactly one of refs_path "
+                "(live Mooncake) or archive_path (durable snapshot archive)"
+            )
+        required = ["local_hostname"]
+        if self.refs_path:
+            required.extend(("refs_path", "metadata_server", "master_server_addr"))
+        else:
+            required.append("archive_path")
+            if self.metadata_server or self.master_server_addr:
+                raise ValueError(
+                    "archive snapshot training must not configure Mooncake endpoints"
+                )
+        for name in required:
             value = getattr(self, name)
             if not value or value.strip() != value:
                 raise ValueError(f"data.mooncake_snapshots.{name} must be non-empty")
-        if self.protocol == "rdma" and not self.rdma_devices:
+        if self.refs_path and self.protocol == "rdma" and not self.rdma_devices:
             raise ValueError(
                 "data.mooncake_snapshots.rdma_devices is required for RDMA"
             )
