@@ -1,5 +1,5 @@
 # coding=utf-8
-"""Read SGLang ``maas_target_kv_v1`` snapshots directly from Mooncake."""
+"""Read SGLang target-KV snapshots with compact logits or final hidden."""
 
 from __future__ import annotations
 
@@ -20,6 +20,9 @@ from specforge.runtime.data_plane.feature_store import FeatureStore
 
 PAYLOAD_FORMAT = "maas_target_kv_v1"
 CONTRACT_ID = "maas-target-kv-top128-v1"
+HIDDEN_PAYLOAD_FORMAT = "experimental_target_kv_final_hidden_v1"
+HIDDEN_CONTRACT_ID = "experimental-target-kv-final-hidden-v1"
+_FORMATS = {CONTRACT_ID: PAYLOAD_FORMAT, HIDDEN_CONTRACT_ID: HIDDEN_PAYLOAD_FORMAT}
 _MAX_MANIFEST_BYTES = 8 << 20
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
 _DIGEST = re.compile(r"^[a-f0-9]{64}$")
@@ -33,16 +36,6 @@ _DTYPES = {
 }
 _ELEMENT_BYTES = {
     name: torch.empty((), dtype=dtype).element_size() for name, dtype in _DTYPES.items()
-}
-_AUX_NAMES = {
-    "token_ids",
-    "position_ids",
-    "loss_mask",
-    "kv_valid",
-    "logits_positions",
-    "teacher_topk_ids",
-    "teacher_topk_logits",
-    "teacher_logsumexp",
 }
 
 
@@ -171,13 +164,16 @@ def validate_manifest(
         "objects",
         "total_tensor_bytes",
     }
+    hidden = root.get("contract_id") == HIDDEN_CONTRACT_ID
+    if hidden:
+        required_root |= {"hidden_size", "hidden_semantics"}
     allowed_root = required_root | {"extensions"}
     if set(root) - allowed_root or not required_root.issubset(root):
         raise SnapshotContractError("manifest root fields do not match schema v1")
     if (
         root["schema_version"] != 1
-        or root["payload_format"] != PAYLOAD_FORMAT
-        or root["contract_id"] != CONTRACT_ID
+        or root["contract_id"] not in _FORMATS
+        or root["payload_format"] != _FORMATS[root["contract_id"]]
         or root["state"] != "READY"
         or root["input_mode"] != "target_kv"
     ):
@@ -208,7 +204,7 @@ def validate_manifest(
         raise SnapshotContractError("teacher vocabulary is smaller than top-128")
     _require_digest(teacher.get("fingerprint_sha256"), "teacher fingerprint")
 
-    logits = _require_dict(root["logits"], "logits")
+    logits = {} if hidden else _require_dict(root["logits"], "logits")
     expected_logits = {
         "top_k": 128,
         "dtype": "float32",
@@ -218,7 +214,16 @@ def validate_manifest(
         "row_alignment": "predicts_token_at_logits_position",
         "vocab_ids": "global_unpadded",
     }
-    if any(logits.get(key) != value for key, value in expected_logits.items()):
+    if hidden and (
+        root["logits"] is not None
+        or _positive_int(root["hidden_size"], "hidden_size") != 2560
+        or root["hidden_semantics"]
+        != "post_final_norm_lm_head_input_predicts_logits_position"
+    ):
+        raise SnapshotContractError("unsupported final hidden semantics")
+    if not hidden and any(
+        logits.get(key) != value for key, value in expected_logits.items()
+    ):
         raise SnapshotContractError("unsupported teacher logits semantics")
 
     kv = _require_dict(root["kv"], "kv")
@@ -282,6 +287,10 @@ def validate_manifest(
         f"draft-data/{root['dataset_id']}/{root['sample_id']}/{root['generation_id']}/"
     )
     aux_specs = _aux_specs(total_length, response_length)
+    if hidden:
+        for name in ("teacher_topk_ids", "teacher_topk_logits", "teacher_logsumexp"):
+            del aux_specs[name]
+        aux_specs["teacher_final_hidden"] = ("bfloat16", [response_length, 2560])
     geometries = {layer["layer_id"]: layer for layer in layers}
     seen_ids: set[str] = set()
     seen_keys: set[str] = set()
@@ -342,7 +351,7 @@ def validate_manifest(
 
         if obj["kind"] == "aux":
             name = obj["name"]
-            if name not in _AUX_NAMES or name in seen_aux:
+            if name not in aux_specs or name in seen_aux:
                 raise SnapshotContractError("unknown or duplicate aux tensor")
             if (
                 (object_dtype, shape) != aux_specs[name]
@@ -397,7 +406,7 @@ def validate_manifest(
             raise SnapshotContractError("noncanonical KV object key")
         groups.setdefault((layer_id, component), []).append(obj)
 
-    if seen_aux != _AUX_NAMES or total != total_tensor_bytes:
+    if seen_aux != set(aux_specs) or total != total_tensor_bytes:
         raise SnapshotContractError("missing aux fields or inconsistent total bytes")
     if {obj["owner_id"] for obj in objects} != set(owners):
         raise SnapshotContractError("manifest has no objects for one or more owners")
@@ -473,6 +482,8 @@ def validate_tensors(
     expected_valid[:valid_length] = 1
     if not torch.equal(aux["kv_valid"], expected_valid):
         raise SnapshotContractError("KV validity differs from object coverage")
+    if manifest["contract_id"] == HIDDEN_CONTRACT_ID:
+        return
     ids = aux["teacher_topk_ids"]
     if not ((ids >= 0) & (ids < vocab_size)).all():
         raise SnapshotContractError("teacher top-k IDs are outside the vocabulary")
@@ -615,8 +626,8 @@ class SnapshotArchiveRefReader:
                     num_tokens=int(manifest["sequence"]["total_length"]),
                     estimated_bytes=int(manifest["total_tensor_bytes"]),
                     metadata={
-                        "payload_format": PAYLOAD_FORMAT,
-                        "contract_id": CONTRACT_ID,
+                        "payload_format": manifest["payload_format"],
+                        "contract_id": manifest["contract_id"],
                         "dataset_id": dataset_id,
                         "manifest_sample_id": sample_id,
                         "generation_id": generation_id,
@@ -625,7 +636,11 @@ class SnapshotArchiveRefReader:
                         "manifest_nbytes": len(manifest_bytes),
                         "tensors_path": str(tensors_path),
                         "tensors_sha256": expected_tensor_digest,
-                        "target_repr": "topk_logits_lse",
+                        "target_repr": (
+                            "final_hidden"
+                            if manifest["contract_id"] == HIDDEN_CONTRACT_ID
+                            else "topk_logits_lse"
+                        ),
                     },
                 )
             )
@@ -730,7 +745,7 @@ class SnapshotRefReader:
             }
             if not required.issubset(record):
                 raise SnapshotContractError("publication is missing manifest identity")
-            if record["contract_id"] != CONTRACT_ID:
+            if record["contract_id"] not in _FORMATS:
                 raise SnapshotContractError("publication uses an unsupported contract")
             dataset_id = _require_identifier(record["dataset_id"], "dataset_id")
             sample_id = _require_identifier(record["sample_id"], "sample_id")
@@ -775,15 +790,19 @@ class SnapshotRefReader:
                     num_tokens=int(record.get("num_tokens", 0)),
                     estimated_bytes=int(record.get("estimated_bytes", 0)),
                     metadata={
-                        "payload_format": PAYLOAD_FORMAT,
-                        "contract_id": CONTRACT_ID,
+                        "payload_format": _FORMATS[record["contract_id"]],
+                        "contract_id": record["contract_id"],
                         "dataset_id": dataset_id,
                         "manifest_sample_id": sample_id,
                         "generation_id": generation_id,
                         "manifest_key": manifest_key,
                         "manifest_sha256": manifest_digest,
                         "manifest_nbytes": manifest_nbytes,
-                        "target_repr": "topk_logits_lse",
+                        "target_repr": (
+                            "final_hidden"
+                            if record["contract_id"] == HIDDEN_CONTRACT_ID
+                            else "topk_logits_lse"
+                        ),
                         "read_lease": record.get("read_lease"),
                         "claim_token": record.get("claim_token"),
                     },
@@ -895,6 +914,11 @@ class MooncakeSnapshotFeatureStore(FeatureStore):
         )
         if identity != expected:
             raise SnapshotContractError("publication and manifest identities differ")
+        if any(
+            manifest[field] != metadata[field]
+            for field in ("contract_id", "payload_format")
+        ):
+            raise SnapshotContractError("publication and manifest formats differ")
         self._validate_expected_contract(manifest)
         return manifest
 

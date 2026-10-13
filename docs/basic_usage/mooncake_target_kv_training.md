@@ -83,3 +83,48 @@ validates the index file digests, every manifest, every tensor descriptor, and
 every tensor checksum before a sample enters the training batch. It uses the
 same target-KV model contract and `CE + lambda_tv * TV128` objective as the
 live Mooncake reader.
+
+## Experimental final-hidden snapshots
+
+The reader also accepts `experimental_target_kv_final_hidden_v1` with contract
+`experimental-target-kv-final-hidden-v1`, emitted by the Qwen3.5-4B capture
+experiment. This format contains BF16 `teacher_final_hidden[R,2560]` instead of
+top-128/LSE tensors. The hidden must be the **post-final-norm LM-head input**;
+row `r` predicts the token at `logits_positions[r]`, including the first response
+token. Pre-norm hidden and mixed hidden/top-k payloads are rejected.
+
+Use the same `data.mooncake_snapshots` configuration for live Store refs or
+archives. Live publication records must carry the hidden contract ID. The draft
+contract must match the captured teacher identity and selected KV geometry;
+the three-layer experiment requires layers **3, 15, 31**, rather than the
+eight-layer example above. A source must use one teacher representation.
+
+The normalizer aligns hidden rows to target token positions and preserves
+`teacher_valid` through truncation and padding. During training, the frozen
+target LM head processes only valid rows in chunks of 32. The configured target
+output transform is applied, then raw top-128 IDs/logits and full-vocabulary
+FP32 logsumexp are reconstructed under `no_grad`. The existing CE+TV128 objective
+then runs unchanged; TV does not renormalize the retained top-128 mass. The
+target transformer is neither loaded nor executed by this snapshot path.
+
+This moves teacher-logit work to the trainer; it does not eliminate that work.
+Stored compact-logit samples still use their original tensors. The checkpoint
+records the actual snapshot format and rejects a different format on resume.
+This experimental format remains restricted to width 2,560 and BF16.
+
+A reproducible single-H100 integration smoke uses genuine serving archives,
+replays their bytes into an isolated TCP Mooncake Store, then runs the standard
+SpecForge trainer for two steps and resumes for two more:
+
+```bash
+python scripts/experiments/smoke_hidden_mooncake.py \
+  --archives /data/hidden-readback-0 /data/hidden-readback-1 \
+  --output /tmp/hidden-training-run
+```
+
+It requires the paired local Qwen3.5-4B weights, the `mooncake_master` binary,
+the Mooncake Python SDK and SpecForge's normal training dependencies. Logs,
+resolved recipes, read/reconstruction counters and checkpoints are written to
+the output directory. This smoke verifies a fixed sample set over live Store
+transport; concurrent serving, streaming claim/ACK, multi-GPU training and
+trained-draft acceptance are separate validation steps.

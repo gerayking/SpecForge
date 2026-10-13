@@ -20,9 +20,41 @@ from specforge.modeling.draft.target_kv import SharedHeadTransform, target_kv_co
 
 
 class OnlineTargetKVDSparkModel(OnlineDSparkModel):
-    """Uses captured target KV as context and top-128 logits as teacher data."""
+    """Train on captured KV with stored or final-hidden-derived top-128 teachers."""
 
     input_mode = "target_kv"
+
+    @torch.no_grad()
+    def teacher_from_hidden(self, hidden, valid, *, chunk_rows=32):
+        """Reconstruct compact teachers using only the frozen target output head."""
+        if (
+            hidden.shape[:-1] != valid.shape
+            or hidden.shape[-1] != self.lm_head.weight.shape[1]
+        ):
+            raise ValueError("teacher hidden shape differs from positions or LM head")
+        if chunk_rows < 1 or any(p.requires_grad for p in self.lm_head.parameters()):
+            raise ValueError(
+                "teacher reconstruction requires a frozen head and positive chunk size"
+            )
+        valid = valid.bool()
+        if not valid.any():
+            raise ValueError("hidden batch has no valid teacher rows")
+        indices = valid.reshape(-1).nonzero().flatten()
+        rows = hidden.reshape(-1, hidden.shape[-1])
+        ids = torch.zeros((*valid.shape, 128), dtype=torch.long, device=hidden.device)
+        scores = torch.zeros_like(ids, dtype=torch.float32)
+        lse = torch.zeros(valid.shape, dtype=torch.float32, device=hidden.device)
+        # Bound full-vocabulary intermediates independently of sequence length.
+        for positions in indices.split(chunk_rows):
+            values = rows[positions].to(self.lm_head.weight.dtype)
+            logits = self.shared_head_transform.apply(self.lm_head(values)).float()
+            if not torch.isfinite(logits).all():
+                raise ValueError("reconstructed teacher logits are nonfinite")
+            top_scores, top_ids = logits.topk(128, dim=-1)
+            ids.view(-1, 128)[positions] = top_ids
+            scores.view(-1, 128)[positions] = top_scores
+            lse.view(-1)[positions] = torch.logsumexp(logits, dim=-1)
+        return ids, scores, lse
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -218,11 +250,21 @@ class OnlineTargetKVDSparkModel(OnlineDSparkModel):
         position_ids: torch.Tensor,
         loss_mask: torch.Tensor,
         target_kv: Mapping[str, torch.Tensor],
-        teacher_topk_ids: torch.Tensor,
-        teacher_topk_logits: torch.Tensor,
-        teacher_logsumexp: torch.Tensor,
         teacher_valid: torch.Tensor,
+        teacher_topk_ids: torch.Tensor | None = None,
+        teacher_topk_logits: torch.Tensor | None = None,
+        teacher_logsumexp: torch.Tensor | None = None,
+        teacher_final_hidden: torch.Tensor | None = None,
     ):
+        compact = (teacher_topk_ids, teacher_topk_logits, teacher_logsumexp)
+        if teacher_final_hidden is not None:
+            if any(value is not None for value in compact):
+                raise ValueError("batch mixes hidden and top-k teacher representations")
+            teacher_topk_ids, teacher_topk_logits, teacher_logsumexp = (
+                self.teacher_from_hidden(teacher_final_hidden, teacher_valid)
+            )
+        elif any(value is None for value in compact):
+            raise ValueError("batch has incomplete top-k teacher data")
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
             raise ValueError(
                 "flex_attention is unavailable on this device; use sdpa/eager"

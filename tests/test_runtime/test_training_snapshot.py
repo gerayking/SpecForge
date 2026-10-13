@@ -7,6 +7,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -15,11 +17,14 @@ from specforge.algorithms.common.target_kv_data import (
     normalize_target_kv_sample,
 )
 from specforge.runtime.data_plane.training_snapshot import (
+    HIDDEN_CONTRACT_ID,
+    HIDDEN_PAYLOAD_FORMAT,
     MooncakeSnapshotFeatureStore,
     SnapshotArchiveFeatureStore,
     SnapshotArchiveRefReader,
     SnapshotContractError,
     SnapshotRefReader,
+    validate_manifest,
 )
 
 
@@ -238,12 +243,160 @@ class _FakeMooncakeStore:
         return min(size, len(data))
 
 
+def _hidden_snapshot():
+    payloads, publication, tensors, contract = _snapshot()
+    manifest = json.loads(payloads[publication["manifest_key"]])
+    for obj in list(manifest["objects"]):
+        if obj["name"].startswith("teacher_"):
+            manifest["objects"].remove(obj)
+            del payloads[obj["key"]]
+            del tensors[obj["name"]]
+    hidden = torch.arange(3 * 2560).reshape(3, 2560).to(torch.bfloat16)
+    key = (
+        publication["manifest_key"].removesuffix("manifest")
+        + "aux/teacher_final_hidden"
+    )
+    payloads[key] = _tensor_bytes(hidden)
+    tensors["teacher_final_hidden"] = hidden
+    manifest["objects"].append(
+        {
+            "object_id": "aux-hidden",
+            "name": "teacher_final_hidden",
+            "kind": "aux",
+            "key": key,
+            "dtype": "bfloat16",
+            "shape": list(hidden.shape),
+            "nbytes": len(payloads[key]),
+            "sha256": _sha256(payloads[key]),
+            "owner_id": "dp0-pp0-tp0",
+            "byte_order": "little",
+            "contiguous": True,
+        }
+    )
+    manifest.update(
+        contract_id=HIDDEN_CONTRACT_ID,
+        payload_format=HIDDEN_PAYLOAD_FORMAT,
+        logits=None,
+        hidden_size=2560,
+        hidden_semantics="post_final_norm_lm_head_input_predicts_logits_position",
+        total_tensor_bytes=sum(obj["nbytes"] for obj in manifest["objects"]),
+    )
+    data = json.dumps(manifest).encode()
+    payloads[publication["manifest_key"]] = data
+    publication.update(
+        contract_id=HIDDEN_CONTRACT_ID,
+        manifest_nbytes=len(data),
+        manifest_sha256=_sha256(data),
+    )
+    return payloads, publication, tensors, contract
+
+
 class _UnregisterFailureStore(_FakeMooncakeStore):
     def unregister_buffer(self, pointer):
         return -1
 
 
 class TestTrainingSnapshot(unittest.TestCase):
+    def test_snapshot_launch_preserves_resume_contract(self):
+        from specforge.algorithms.common.providers import StepRuntimeConfig
+        from specforge.launch import _build_mooncake_snapshot_runtime
+
+        runtime = StepRuntimeConfig(
+            options={},
+            resume_contract={"test_identity": "bound"},
+            allowed_missing_checkpoint_keys=frozenset(),
+        )
+        _, _, _, contract = _snapshot()
+        refs = [SimpleNamespace(metadata={"payload_format": HIDDEN_PAYLOAD_FORMAT})]
+        with (
+            patch(
+                "specforge.runtime.data_plane.training_snapshot.SnapshotArchiveRefReader"
+            ) as reader,
+            patch(
+                "specforge.runtime.data_plane.training_snapshot.SnapshotArchiveFeatureStore"
+            ),
+            patch("specforge.launch._shard_offline_refs", return_value=refs),
+            patch("specforge.launch._assemble_trainer") as assemble,
+        ):
+            reader.return_value.read.return_value = refs
+            _build_mooncake_snapshot_runtime(
+                algorithm=SimpleNamespace(name="dspark"),
+                snapshot_config=SimpleNamespace(
+                    archive_path="unused", max_receive_bytes=1 << 20
+                ),
+                draft_model=SimpleNamespace(target_kv_contract=contract),
+                optimizer_factory=None,
+                run_id="test",
+                output_dir="unused",
+                strategy_kwargs=runtime,
+                resume_from="checkpoint-step2",
+            )
+        self.assertIs(assemble.call_args.kwargs["strategy_kwargs"], runtime)
+        self.assertEqual(
+            assemble.call_args.kwargs["checkpoint_extra"]["snapshot_payload_format"],
+            HIDDEN_PAYLOAD_FORMAT,
+        )
+
+    def test_hidden_read_alignment_truncation_and_padding(self):
+        payloads, publication, source, contract = _hidden_snapshot()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "refs.json"
+            path.write_text(json.dumps(publication))
+            ref = SnapshotRefReader(str(path), run_id="hidden").read()[0]
+        self.assertEqual(ref.metadata["target_repr"], "final_hidden")
+        store = MooncakeSnapshotFeatureStore(
+            store=_FakeMooncakeStore(payloads), expected_contract=contract
+        )
+        raw, handle = store.get(ref)
+        full = normalize_target_kv_sample(raw, contract=contract, max_len=5)
+        short = normalize_target_kv_sample(raw, contract=contract, max_len=4)
+        batch = build_target_kv_collator(contract)([full, short])
+        self.assertEqual(
+            batch["teacher_valid"].tolist(), [[0, 0, 1, 1, 1], [0, 0, 1, 1, 0]]
+        )
+        torch.testing.assert_close(
+            batch["teacher_final_hidden"][0, 2:], source["teacher_final_hidden"]
+        )
+        torch.testing.assert_close(
+            batch["teacher_final_hidden"][1, 2:4], source["teacher_final_hidden"][:2]
+        )
+        self.assertFalse(batch["teacher_final_hidden"][:, :2].any())
+        self.assertFalse(batch["teacher_final_hidden"][1, 4].any())
+        store.release(handle)
+        store.close()
+
+    def test_hidden_contract_and_corruption_rejected(self):
+        payloads, publication, _, _ = _hidden_snapshot()
+        manifest = json.loads(payloads[publication["manifest_key"]])
+        for field, value in (
+            ("hidden_semantics", "pre_norm"),
+            ("hidden_size", 128),
+            ("logits", {}),
+            ("payload_format", "maas_target_kv_v1"),
+        ):
+            with self.subTest(field=field), self.assertRaises(SnapshotContractError):
+                validate_manifest({**manifest, field: value})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "refs.json"
+            path.write_text(json.dumps(publication))
+            ref = SnapshotRefReader(str(path), run_id="hidden").read()[0]
+        key = next(key for key in payloads if key.endswith("teacher_final_hidden"))
+        payloads[key] = bytes([payloads[key][0] ^ 1]) + payloads[key][1:]
+        store = MooncakeSnapshotFeatureStore(store=_FakeMooncakeStore(payloads))
+        with self.assertRaisesRegex(SnapshotContractError, "checksum"):
+            store.get(ref)
+        store.close()
+
+    def test_hidden_and_topk_batches_cannot_mix(self):
+        _, _, hidden, contract = _hidden_snapshot()
+        _, _, compact, _ = _snapshot()
+        features = [
+            normalize_target_kv_sample(value, contract=contract, max_len=5)
+            for value in (hidden, compact)
+        ]
+        with self.assertRaisesRegex(ValueError, "mixes"):
+            build_target_kv_collator(contract)(features)
+
     def test_snapshot_archive_to_validated_training_batch(self):
         from safetensors.torch import save_file
 

@@ -696,6 +696,10 @@ def _build_mooncake_snapshot_runtime(
             strategy=algorithm.name,
         ).read()
 
+    payload_formats = {ref.metadata["payload_format"] for ref in source_refs}
+    if len(payload_formats) != 1:
+        raise ValueError("snapshot source must use one teacher representation")
+
     def refs_for_epoch(epoch):
         return _shard_offline_refs(
             source_refs,
@@ -749,6 +753,7 @@ def _build_mooncake_snapshot_runtime(
         logger=logger,
         log_interval=log_interval,
         collate_fn=build_target_kv_collator(contract),
+        strategy_kwargs=strategy_kwargs,
         per_sample_transform=build_target_kv_normalizer(contract, max_len),
         clone_on_fetch=False,
         durable_ack=False,
@@ -757,7 +762,7 @@ def _build_mooncake_snapshot_runtime(
             "offline_sampler_version": 1,
             "sampler_seed": seed,
             "source_dataset_size": len(source_refs),
-            "snapshot_payload_format": "maas_target_kv_v1",
+            "snapshot_payload_format": next(iter(payload_formats)),
         },
         max_checkpoints=max_checkpoints,
         dataloader_num_workers=dataloader_num_workers,

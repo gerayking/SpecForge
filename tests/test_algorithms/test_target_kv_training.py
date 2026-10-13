@@ -1,8 +1,8 @@
 # coding=utf-8
 """Loss tests for compact teacher supervision in target-KV DSpark."""
 
-import unittest
 import copy
+import unittest
 
 import torch
 import torch.nn.functional as F
@@ -80,6 +80,38 @@ def _target_kv_contract():
 
 
 class TestTargetKVObjective(unittest.TestCase):
+    def test_hidden_reconstruction_matches_transformed_full_vocabulary(self):
+        torch.manual_seed(11)
+        model = _objective_model()
+        model.lm_head.requires_grad_(False)
+        model.shared_head_transform = SharedHeadTransform.decode(
+            '{"logit_scale":0.5,"final_logit_softcapping":2.0}'
+        )
+        hidden = torch.randn(2, 5, 4, requires_grad=True)
+        valid = torch.tensor([[0, 0, 1, 1, 1], [0, 1, 1, 0, 0]], dtype=torch.bool)
+        ids, scores, lse = model.teacher_from_hidden(hidden, valid, chunk_rows=2)
+        logits = model.shared_head_transform.apply(model.lm_head(hidden[valid])).float()
+        expected_scores, expected_ids = logits.topk(128, dim=-1)
+        torch.testing.assert_close(ids[valid], expected_ids)
+        torch.testing.assert_close(scores[valid], expected_scores)
+        torch.testing.assert_close(lse[valid], logits.logsumexp(-1))
+        self.assertFalse(scores.requires_grad)
+        self.assertFalse(lse.requires_grad)
+        self.assertFalse(scores[~valid].any())
+        self.assertTrue((torch.exp(scores[valid] - lse[valid, None]).sum(-1) < 1).all())
+
+    def test_hidden_reconstruction_rejects_unfrozen_head_and_invalid_rows(self):
+        model = _objective_model()
+        hidden = torch.ones(1, 2, 4)
+        valid = torch.ones(1, 2, dtype=torch.bool)
+        with self.assertRaisesRegex(ValueError, "frozen"):
+            model.teacher_from_hidden(hidden, valid)
+        model.lm_head.requires_grad_(False)
+        with self.assertRaisesRegex(ValueError, "no valid"):
+            model.teacher_from_hidden(hidden, ~valid)
+        with self.assertRaisesRegex(ValueError, "shape"):
+            model.teacher_from_hidden(hidden[..., :3], valid)
+
     def test_shared_head_transform_matches_serving_order(self):
         transform = SharedHeadTransform.decode(
             '{"logit_scale":0.5,"final_logit_softcapping":2.0}'

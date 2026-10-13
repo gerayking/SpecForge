@@ -1,5 +1,5 @@
 # coding=utf-8
-"""Normalization and collation for ``maas_target_kv_v1`` samples."""
+"""Align target-KV samples and either teacher representation to token positions."""
 
 from __future__ import annotations
 
@@ -25,16 +25,24 @@ def normalize_target_kv_sample(
     contract: Mapping[str, Any],
     max_len: int,
 ) -> dict[str, torch.Tensor]:
+    hidden = "teacher_final_hidden" in raw
+    teacher_names = (
+        {"teacher_final_hidden"}
+        if hidden
+        else {"teacher_topk_ids", "teacher_topk_logits", "teacher_logsumexp"}
+    )
+    if hidden and any(
+        name in raw
+        for name in ("teacher_topk_ids", "teacher_topk_logits", "teacher_logsumexp")
+    ):
+        raise ValueError("sample mixes hidden and top-k teacher representations")
     required_aux = {
         "token_ids",
         "position_ids",
         "loss_mask",
         "kv_valid",
         "logits_positions",
-        "teacher_topk_ids",
-        "teacher_topk_logits",
-        "teacher_logsumexp",
-    }
+    } | teacher_names
     kv_names = set(target_kv_feature_names(contract))
     missing = (required_aux | kv_names) - set(raw)
     if missing:
@@ -48,24 +56,22 @@ def normalize_target_kv_sample(
     if not keep.any():
         raise ValueError("target-KV sample has no teacher rows after truncation")
 
-    topk = int(raw["teacher_topk_ids"].shape[-1])
-    teacher_ids = torch.zeros(total_length, topk, dtype=torch.long)
-    teacher_logits = torch.zeros(total_length, topk, dtype=torch.float32)
-    teacher_lse = torch.zeros(total_length, dtype=torch.float32)
     teacher_valid = torch.zeros(total_length, dtype=torch.bool)
-    teacher_ids[logits_positions] = raw["teacher_topk_ids"][keep].long()
-    teacher_logits[logits_positions] = raw["teacher_topk_logits"][keep].float()
-    teacher_lse[logits_positions] = raw["teacher_logsumexp"][keep].float()
     teacher_valid[logits_positions] = True
+    teacher = {}
+    for name in teacher_names:
+        value = raw[name]
+        dtype = torch.long if name == "teacher_topk_ids" else value.dtype
+        aligned = torch.zeros((total_length, *value.shape[1:]), dtype=dtype)
+        aligned[logits_positions] = value[keep].to(dtype)
+        teacher[name] = aligned.unsqueeze(0)
 
     normalized = {
         "input_ids": raw["token_ids"][:total_length].long().unsqueeze(0),
         "position_ids": raw["position_ids"][:total_length].long().unsqueeze(0),
         "loss_mask": raw["loss_mask"][:total_length].long().unsqueeze(0),
         "kv_valid": raw["kv_valid"][:total_length].bool().unsqueeze(0),
-        "teacher_topk_ids": teacher_ids.unsqueeze(0),
-        "teacher_topk_logits": teacher_logits.unsqueeze(0),
-        "teacher_logsumexp": teacher_lse.unsqueeze(0),
+        **teacher,
         "teacher_valid": teacher_valid.unsqueeze(0),
     }
     for name in kv_names:
@@ -93,19 +99,24 @@ def build_target_kv_collator(contract: Mapping[str, Any]):
         "position_ids",
         "loss_mask",
         "kv_valid",
-        "teacher_topk_ids",
-        "teacher_topk_logits",
-        "teacher_logsumexp",
         "teacher_valid",
         *kv_names,
     )
-    sequence_axes = {name: 1 for name in required}
 
     def collate(features):
+        hidden = ["teacher_final_hidden" in item for item in features]
+        if any(hidden) and not all(hidden):
+            raise ValueError("batch mixes hidden and top-k teacher representations")
+        teacher_names = (
+            ("teacher_final_hidden",)
+            if all(hidden)
+            else ("teacher_topk_ids", "teacher_topk_logits", "teacher_logsumexp")
+        )
+        keys = (*required, *teacher_names)
         return pad_and_concatenate_features(
             features,
-            sequence_axes=sequence_axes,
-            required_keys=required,
+            sequence_axes={name: 1 for name in keys},
+            required_keys=keys,
         )
 
     return collate

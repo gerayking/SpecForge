@@ -481,9 +481,6 @@ class DSparkTrainStrategy(DraftTrainStrategy):
                 "input_ids",
                 "position_ids",
                 "loss_mask",
-                "teacher_topk_ids",
-                "teacher_topk_logits",
-                "teacher_logsumexp",
                 "teacher_valid",
                 *{
                     f"target_{component}.{layer['layer_id']}"
@@ -506,6 +503,20 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         device = self._device()
         if self.input_mode == "target_kv":
             contract = self.target_kv_contract
+            teacher_names = (
+                ("teacher_final_hidden",)
+                if "teacher_final_hidden" in t
+                else ("teacher_topk_ids", "teacher_topk_logits", "teacher_logsumexp")
+            )
+            if "teacher_final_hidden" in t and any(
+                name in t
+                for name in (
+                    "teacher_topk_ids",
+                    "teacher_topk_logits",
+                    "teacher_logsumexp",
+                )
+            ):
+                raise ValueError("batch mixes hidden and top-k teacher representations")
             target_kv = {
                 name: t[name].to(device)
                 for name in {
@@ -519,9 +530,7 @@ class DSparkTrainStrategy(DraftTrainStrategy):
                 position_ids=t["position_ids"].to(device),
                 loss_mask=t["loss_mask"].to(device),
                 target_kv=target_kv,
-                teacher_topk_ids=t["teacher_topk_ids"].to(device),
-                teacher_topk_logits=t["teacher_topk_logits"].to(device),
-                teacher_logsumexp=t["teacher_logsumexp"].to(device),
+                **{name: t[name].to(device) for name in teacher_names},
                 teacher_valid=t["teacher_valid"].to(device),
             )
         else:
